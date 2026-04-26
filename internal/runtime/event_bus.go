@@ -1,6 +1,24 @@
 package runtime
 
-import "time"
+import (
+	"strings"
+	"time"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
+)
+
+// containsAny reports whether s contains any of the listed substrings (case-insensitive).
+// Used by Spec 042 telemetry classification on error messages — only the
+// resulting enum category is ever recorded; the message itself is never.
+func containsAny(s string, substrs ...string) bool {
+	low := strings.ToLower(s)
+	for _, sub := range substrs {
+		if strings.Contains(low, strings.ToLower(sub)) {
+			return true
+		}
+	}
+	return false
+}
 
 const defaultEventBuffer = 256 // Increased from 16 to prevent event dropping when many servers.changed events flood the bus
 
@@ -77,6 +95,9 @@ func (r *Runtime) EmitOAuthTokenRefreshed(serverName string, expiresAt time.Time
 // EmitOAuthRefreshFailed emits an event when proactive token refresh fails after retries.
 // This is used by the RefreshManager to notify subscribers that re-authentication is needed.
 func (r *Runtime) EmitOAuthRefreshFailed(serverName string, errorMsg string) {
+	// Spec 042: increment the error category counter (no message recorded).
+	telemetry.RecordErrorOn(r.TelemetryRegistry(), telemetry.ErrCatOAuthRefreshFailed)
+
 	payload := map[string]any{
 		"server_name": serverName,
 		"error":       errorMsg,
@@ -105,7 +126,20 @@ func (r *Runtime) EmitActivityToolCallStarted(serverName, toolName, sessionID, r
 // arguments is the input parameters passed to the tool call
 // toolVariant is the MCP tool variant used (call_tool_read/write/destructive) - optional
 // intent is the intent declaration metadata - optional
-func (r *Runtime) EmitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response string, responseTruncated bool, toolVariant string, intent map[string]interface{}) {
+func (r *Runtime) EmitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response string, responseTruncated bool, toolVariant string, intent map[string]interface{}, contentTrust string) {
+	// Spec 042: classify failed tool calls into the upstream error categories.
+	// We never record the error message itself; only a fixed enum value.
+	if status == "error" && errorMsg != "" {
+		switch {
+		case containsAny(errorMsg, "i/o timeout", "context deadline exceeded", "connect: timeout"):
+			telemetry.RecordErrorOn(r.TelemetryRegistry(), telemetry.ErrCatUpstreamConnectTimeout)
+		case containsAny(errorMsg, "connection refused", "connect: refused"):
+			telemetry.RecordErrorOn(r.TelemetryRegistry(), telemetry.ErrCatUpstreamConnectRefused)
+		case containsAny(errorMsg, "handshake", "tls:"):
+			telemetry.RecordErrorOn(r.TelemetryRegistry(), telemetry.ErrCatUpstreamHandshakeFailed)
+		}
+	}
+
 	payload := map[string]any{
 		"server_name":        serverName,
 		"tool_name":          toolName,
@@ -129,11 +163,21 @@ func (r *Runtime) EmitActivityToolCallCompleted(serverName, toolName, sessionID,
 	if intent != nil {
 		payload["intent"] = intent
 	}
+	// Add content trust metadata if provided (Spec 035)
+	if contentTrust != "" {
+		payload["content_trust"] = contentTrust
+	}
 	r.publishEvent(newEvent(EventTypeActivityToolCallCompleted, payload))
 }
 
 // EmitActivityPolicyDecision emits an event when a policy blocks a tool call.
 func (r *Runtime) EmitActivityPolicyDecision(serverName, toolName, sessionID, decision, reason string) {
+	// Spec 042: classify policy blocks as a tool quarantine error category.
+	// "blocked" decisions are user-visible reliability events worth counting.
+	if decision == "blocked" || decision == "block" {
+		telemetry.RecordErrorOn(r.TelemetryRegistry(), telemetry.ErrCatToolQuarantineBlocked)
+	}
+
 	payload := map[string]any{
 		"server_name": serverName,
 		"tool_name":   toolName,
@@ -181,7 +225,7 @@ func (r *Runtime) EmitActivitySystemStop(reason, signal string, uptimeSeconds in
 // targetServer and targetTool are used for call_tool_* handlers
 // arguments contains the input parameters, response contains the output
 // intent is the intent declaration metadata
-func (r *Runtime) EmitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}, intent map[string]interface{}) {
+func (r *Runtime) EmitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}, intent map[string]interface{}, contentTrust string) {
 	payload := map[string]any{
 		"internal_tool_name": internalToolName,
 		"session_id":         sessionID,
@@ -207,6 +251,9 @@ func (r *Runtime) EmitActivityInternalToolCall(internalToolName, targetServer, t
 	}
 	if intent != nil {
 		payload["intent"] = intent
+	}
+	if contentTrust != "" {
+		payload["content_trust"] = contentTrust
 	}
 	r.publishEvent(newEvent(EventTypeActivityInternalToolCall, payload))
 }
@@ -245,4 +292,68 @@ func (r *Runtime) EmitSensitiveDataDetected(activityID string, detectionCount in
 		"detection_types": detectionTypes,
 	}
 	r.publishEvent(newEvent(EventTypeSensitiveDataDetected, payload))
+}
+
+// EmitSecurityScanStarted emits an event when a security scan begins (Spec 039).
+func (r *Runtime) EmitSecurityScanStarted(serverName string, scanners []string, jobID string) {
+	payload := map[string]any{
+		"server_name": serverName,
+		"scanners":    scanners,
+		"job_id":      jobID,
+	}
+	r.publishEvent(newEvent(EventTypeSecurityScanStarted, payload))
+}
+
+// EmitSecurityScanProgress emits an event for scanner progress updates (Spec 039).
+func (r *Runtime) EmitSecurityScanProgress(serverName, scannerID, status string, progress int) {
+	payload := map[string]any{
+		"server_name": serverName,
+		"scanner_id":  scannerID,
+		"status":      status,
+		"progress":    progress,
+	}
+	r.publishEvent(newEvent(EventTypeSecurityScanProgress, payload))
+}
+
+// EmitSecurityScanCompleted emits an event when a security scan completes (Spec 039).
+func (r *Runtime) EmitSecurityScanCompleted(serverName string, findingsSummary map[string]int) {
+	payload := map[string]any{
+		"server_name":      serverName,
+		"findings_summary": findingsSummary,
+	}
+	r.publishEvent(newEvent(EventTypeSecurityScanCompleted, payload))
+}
+
+// EmitSecurityScanFailed emits an event when a scanner fails (Spec 039).
+func (r *Runtime) EmitSecurityScanFailed(serverName, scannerID, errMsg string) {
+	payload := map[string]any{
+		"server_name": serverName,
+		"scanner_id":  scannerID,
+		"error":       errMsg,
+	}
+	r.publishEvent(newEvent(EventTypeSecurityScanFailed, payload))
+}
+
+// EmitSecurityIntegrityAlert emits an event for integrity violations (Spec 039).
+func (r *Runtime) EmitSecurityIntegrityAlert(serverName, alertType, action string) {
+	payload := map[string]any{
+		"server_name": serverName,
+		"alert_type":  alertType,
+		"action":      action,
+	}
+	r.publishEvent(newEvent(EventTypeSecurityIntegrityAlert, payload))
+}
+
+// EmitSecurityScannerChanged emits an event when a scanner plugin's state
+// changes — notably while a Docker image is being pulled in the background
+// (Spec 039). The UI listens for this and refreshes its scanner list.
+func (r *Runtime) EmitSecurityScannerChanged(scannerID, status, errMsg string) {
+	payload := map[string]any{
+		"scanner_id": scannerID,
+		"status":     status,
+	}
+	if errMsg != "" {
+		payload["error"] = errMsg
+	}
+	r.publishEvent(newEvent(EventTypeSecurityScannerChanged, payload))
 }

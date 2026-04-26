@@ -22,7 +22,9 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/registries"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server/tokens"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/truncate"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream"
@@ -101,6 +103,9 @@ type MCPProxyServer struct {
 
 	// MCP session tracking
 	sessionStore *SessionStore
+
+	// Hooks shared across all routing mode servers
+	hooks *mcpserver.Hooks
 }
 
 // NewMCPProxyServer creates a new MCP proxy server
@@ -122,6 +127,17 @@ func NewMCPProxyServer(
 
 	// Create hooks to capture session information
 	hooks := &mcpserver.Hooks{}
+	// Update session activity on every MCP message to prevent premature cleanup.
+	// Without this, sessions that only do retrieve_tools (not tool calls) would
+	// appear inactive and get closed by the background cleanup.
+	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
+		session := mcpserver.ClientSessionFromContext(ctx)
+		if session == nil {
+			return
+		}
+		sessionStore.UpdateActivity(session.SessionID())
+	})
+
 	hooks.AddOnRegisterSession(func(ctx context.Context, sess mcpserver.ClientSession) {
 		sessionID := sess.SessionID()
 
@@ -164,6 +180,14 @@ func NewMCPProxyServer(
 		// Store/update session information with capabilities
 		sessionStore.SetSession(sessionID, clientName, clientVersion, hasRoots, hasSampling, experimental)
 
+		// Spec 044 (T038): feed the activation funnel. Mark first-ever client
+		// + record the sanitized clientInfo.name in the capped seen-ever list.
+		// Plumbed via runtime → telemetry service → ActivationStore so the
+		// MCP layer stays unaware of BBolt details. nil-safe all the way down.
+		if mainServer != nil && mainServer.runtime != nil {
+			mainServer.runtime.RecordMCPClientForActivation(clientName)
+		}
+
 		logger.Info("MCP client initialized with capabilities",
 			zap.String("session_id", sessionID),
 			zap.String("client_name", clientName),
@@ -192,6 +216,14 @@ func NewMCPProxyServer(
 			zap.String("session_id", sessionID),
 		)
 	})
+
+	// Annotate every tool in tools/list responses with
+	// `_meta.anthropic/maxResultSizeChars`. Claude Code and other clients
+	// that honor this annotation raise their inline-response ceiling from
+	// the default 50k chars up to the declared value (max 500k), so large
+	// upstream tool responses flow through inline instead of being spilled
+	// to disk as a 2KB preview. No-op when config is 0.
+	registerMaxResultSizeHook(hooks, config.MaxResultSizeChars)
 
 	// Create MCP server with capabilities and hooks
 	capabilities := []mcpserver.ServerOption{
@@ -235,6 +267,7 @@ func NewMCPProxyServer(
 		config:          config,
 		jsPool:          jsPool,
 		sessionStore:    sessionStore,
+		hooks:           hooks,
 	}
 
 	// Register proxy tools for the default (retrieve_tools) server
@@ -306,6 +339,35 @@ func injectAuthMetadata(ctx context.Context, args map[string]interface{}) map[st
 	return enriched
 }
 
+// telemetryRegistry returns the Tier 2 counter registry, or nil if telemetry
+// is not initialized. Spec 042. The Record* helpers in the telemetry package
+// are nil-safe so callers do not need to nil-check the return value.
+func (p *MCPProxyServer) telemetryRegistry() *telemetry.CounterRegistry {
+	if p.mainServer == nil || p.mainServer.runtime == nil {
+		return nil
+	}
+	return p.mainServer.runtime.TelemetryRegistry()
+}
+
+// recordMCPSurface increments the surface counter for an MCP request. Always
+// SurfaceMCP regardless of any header. Spec 042 User Story 1.
+func (p *MCPProxyServer) recordMCPSurface() {
+	telemetry.RecordSurfaceOn(p.telemetryRegistry(), telemetry.SurfaceMCP)
+}
+
+// recordBuiltinTool increments the built-in tool histogram for the given
+// tool name. Unknown names are silently dropped at the registry level.
+// Spec 042 User Story 2.
+func (p *MCPProxyServer) recordBuiltinTool(name string) {
+	telemetry.RecordBuiltinToolOn(p.telemetryRegistry(), name)
+}
+
+// recordUpstreamTool increments the upstream tool call counter without ever
+// recording the tool name. Spec 042 User Story 2.
+func (p *MCPProxyServer) recordUpstreamTool() {
+	telemetry.RecordUpstreamToolOn(p.telemetryRegistry())
+}
+
 // emitActivityEvent safely emits an activity event if runtime is available
 // source indicates how the call was triggered: "mcp", "cli", or "api"
 func (p *MCPProxyServer) emitActivityToolCallStarted(serverName, toolName, sessionID, requestID, source string, args map[string]any) {
@@ -319,9 +381,9 @@ func (p *MCPProxyServer) emitActivityToolCallStarted(serverName, toolName, sessi
 // arguments is the input parameters passed to the tool call
 // toolVariant is the MCP tool variant used (call_tool_read/write/destructive) - optional
 // intent is the intent declaration metadata - optional
-func (p *MCPProxyServer) emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response string, responseTruncated bool, toolVariant string, intent map[string]interface{}) {
+func (p *MCPProxyServer) emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response string, responseTruncated bool, toolVariant string, intent map[string]interface{}, contentTrust string) {
 	if p.mainServer != nil && p.mainServer.runtime != nil {
-		p.mainServer.runtime.EmitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg, durationMs, arguments, response, responseTruncated, toolVariant, intent)
+		p.mainServer.runtime.EmitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, source, status, errorMsg, durationMs, arguments, response, responseTruncated, toolVariant, intent, contentTrust)
 	}
 }
 
@@ -336,10 +398,86 @@ func (p *MCPProxyServer) emitActivityPolicyDecision(serverName, toolName, sessio
 // targetServer and targetTool are used for call_tool_* handlers
 // arguments contains the input parameters, response contains the output
 // intent is the intent declaration metadata
-func (p *MCPProxyServer) emitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}, intent map[string]interface{}) {
+func (p *MCPProxyServer) emitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg string, durationMs int64, arguments map[string]interface{}, response interface{}, intent map[string]interface{}, contentTrust string) {
 	if p.mainServer != nil && p.mainServer.runtime != nil {
-		p.mainServer.runtime.EmitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg, durationMs, arguments, response, intent)
+		p.mainServer.runtime.EmitActivityInternalToolCall(internalToolName, targetServer, targetTool, toolVariant, sessionID, requestID, status, errorMsg, durationMs, arguments, response, intent, contentTrust)
 	}
+}
+
+// buildCallToolVariantTool constructs the mcp.Tool definition for a single
+// call_tool_* variant (read/write/destructive). Factored out so both
+// registerTools and schema tests exercise the same builder.
+func buildCallToolVariantTool(variant string) mcp.Tool {
+	var description, title, nameExample, sensitivityDesc, reasonDesc string
+	var opts []mcp.ToolOption
+
+	switch variant {
+	case contracts.ToolVariantRead:
+		description = "Execute a READ-ONLY tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: search, query, list, get, fetch, find, check, view, read, show, describe, lookup, retrieve, browse, explore, discover, scan, inspect, analyze, examine, validate, verify. Examples: search_files, get_user, list_repositories, query_database, find_issues, check_status. This is the DEFAULT choice when unsure - most tools are read-only."
+		title = "Call Tool (Read)"
+		nameExample = "github:get_user"
+		sensitivityDesc = "Classify data being accessed: public, internal, private, or unknown. Helps track sensitive data access patterns."
+		reasonDesc = "Why is this tool being called? Provide context like 'User asked to check status' or 'Gathering data for report'."
+		opts = []mcp.ToolOption{
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(true),
+		}
+	case contracts.ToolVariantWrite:
+		description = "Execute a STATE-MODIFYING tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: create, update, modify, add, set, send, edit, change, write, post, put, patch, insert, upload, submit, assign, configure, enable, register, subscribe, publish, move, copy, rename, merge. Examples: create_issue, update_file, send_message, add_comment, set_status, edit_page. Use only when explicitly modifying state."
+		title = "Call Tool (Write)"
+		nameExample = "github:create_issue"
+		sensitivityDesc = "Classify data being modified: public, internal, private, or unknown. Helps track sensitive data changes."
+		reasonDesc = "Why is this modification needed? Provide context like 'User requested update' or 'Fixing reported issue'."
+		opts = []mcp.ToolOption{
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(true),
+		}
+	case contracts.ToolVariantDestructive:
+		description = "Execute a DESTRUCTIVE tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: delete, remove, drop, revoke, disable, destroy, purge, reset, clear, unsubscribe, cancel, terminate, close, archive, ban, block, disconnect, kill, wipe, truncate, force, hard. Examples: delete_repo, remove_user, drop_table, revoke_access, clear_cache, terminate_session. Use for irreversible or high-impact operations."
+		title = "Call Tool (Destructive)"
+		nameExample = "github:delete_repo"
+		sensitivityDesc = "Classify data being deleted: public, internal, private, or unknown. Important for tracking destructive operations on sensitive data."
+		reasonDesc = "Why is this deletion needed? Provide justification like 'User confirmed cleanup' or 'Removing obsolete data'."
+		opts = []mcp.ToolOption{
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(true),
+		}
+	default:
+		description = "Execute a tool."
+		title = "Call Tool"
+		nameExample = "server:tool"
+		sensitivityDesc = "Classify data sensitivity."
+		reasonDesc = "Why is this tool being called?"
+	}
+
+	allOpts := []mcp.ToolOption{
+		mcp.WithDescription(description),
+		mcp.WithTitleAnnotation(title),
+	}
+	allOpts = append(allOpts, opts...)
+	allOpts = append(allOpts,
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description(fmt.Sprintf("Tool name in format 'server:tool' (e.g., '%s'). CRITICAL: You MUST use exact names from retrieve_tools results - do NOT guess or invent server names. Unknown servers will fail.", nameExample)),
+		),
+		mcp.WithObject("args",
+			mcp.Description("Arguments to pass to the upstream tool as a native JSON object. Refer to the tool's inputSchema from retrieve_tools for required parameters. Example: {\"path\": \"src/index.ts\", \"limit\": 20}. This is the preferred parameter — it eliminates JSON escaping overhead. Use 'args_json' only if your client cannot produce nested JSON objects."),
+		),
+		mcp.WithString("args_json",
+			mcp.Description("Legacy: arguments as a pre-serialized JSON string. Prefer the 'args' parameter instead — it accepts a native JSON object and eliminates escaping overhead. If both are provided, 'args_json' wins for backward compatibility."),
+		),
+		mcp.WithString("intent_data_sensitivity",
+			mcp.Description(sensitivityDesc),
+		),
+		mcp.WithString("intent_reason",
+			mcp.Description(reasonDesc),
+		),
+	)
+
+	return mcp.NewTool(variant, allOpts...)
 }
 
 // registerTools registers all proxy tools with the MCP server
@@ -349,6 +487,8 @@ func (p *MCPProxyServer) registerTools(_ bool) {
 		mcp.WithDescription("🔍 CALL THIS FIRST to discover relevant tools! This is the primary tool discovery mechanism that searches across ALL upstream MCP servers using intelligent BM25 full-text search. Always use this before attempting to call any specific tools. Use natural language to describe what you want to accomplish (e.g., 'create GitHub repository', 'query database', 'weather forecast'). Results include 'annotations' (tool behavior hints like destructiveHint) and 'call_with' recommendation indicating which tool variant to use (call_tool_read/write/destructive). Then use the recommended variant with an 'intent' parameter. NOTE: Quarantined servers are excluded from search results for security. Use 'quarantine_security' tool to examine and manage quarantined servers. TO ADD NEW SERVERS: Use 'list_registries' then 'search_servers' to find and add new MCP servers."),
 		mcp.WithTitleAnnotation("Retrieve Tools"),
 		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Natural language description of what you want to accomplish. Be specific about your task (e.g., 'create a new GitHub repository', 'get weather for London', 'query SQLite database for users'). The search will find the most relevant tools across all connected servers."),
@@ -365,75 +505,22 @@ func (p *MCPProxyServer) registerTools(_ bool) {
 		mcp.WithString("explain_tool",
 			mcp.Description("When debug=true, explain why a specific tool was ranked low (format: 'server:tool')"),
 		),
+		mcp.WithBoolean("include_session_risk_warning",
+			mcp.Description("Include the prose 'warning' string in session_risk when the lethal trifecta is detected (default: false; structured fields are always returned). Server-side default can be flipped via the 'tool_response_session_risk_warning' config flag."),
+		),
 	)
 	p.server.AddTool(retrieveToolsTool, p.handleRetrieveTools)
 
 	// Intent-based tool variants (Spec 018)
 	// These replace the legacy call_tool with three operation-specific variants
 	// that enable granular IDE permission control and require explicit intent declaration.
-
-	// call_tool_read - Read-only operations
-	// NOTE: Intent parameters are flattened (not nested objects) for Gemini 3 Pro compatibility
-	callToolReadTool := mcp.NewTool(contracts.ToolVariantRead,
-		mcp.WithDescription("Execute a READ-ONLY tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: search, query, list, get, fetch, find, check, view, read, show, describe, lookup, retrieve, browse, explore, discover, scan, inspect, analyze, examine, validate, verify. Examples: search_files, get_user, list_repositories, query_database, find_issues, check_status. This is the DEFAULT choice when unsure - most tools are read-only."),
-		mcp.WithTitleAnnotation("Call Tool (Read)"),
-		mcp.WithReadOnlyHintAnnotation(true),
-		mcp.WithString("name",
-			mcp.Required(),
-			mcp.Description("Tool name in format 'server:tool' (e.g., 'github:get_user'). CRITICAL: You MUST use exact names from retrieve_tools results - do NOT guess or invent server names. Unknown servers will fail."),
-		),
-		mcp.WithString("args_json",
-			mcp.Description("Arguments to pass to the tool as JSON string. Refer to the tool's inputSchema from retrieve_tools for required parameters."),
-		),
-		mcp.WithString("intent_data_sensitivity",
-			mcp.Description("Classify data being accessed: public, internal, private, or unknown. Helps track sensitive data access patterns."),
-		),
-		mcp.WithString("intent_reason",
-			mcp.Description("Why is this tool being called? Provide context like 'User asked to check status' or 'Gathering data for report'."),
-		),
-	)
+	callToolReadTool := buildCallToolVariantTool(contracts.ToolVariantRead)
 	p.server.AddTool(callToolReadTool, p.handleCallToolRead)
 
-	// call_tool_write - State-modifying operations
-	callToolWriteTool := mcp.NewTool(contracts.ToolVariantWrite,
-		mcp.WithDescription("Execute a STATE-MODIFYING tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: create, update, modify, add, set, send, edit, change, write, post, put, patch, insert, upload, submit, assign, configure, enable, register, subscribe, publish, move, copy, rename, merge. Examples: create_issue, update_file, send_message, add_comment, set_status, edit_page. Use only when explicitly modifying state."),
-		mcp.WithTitleAnnotation("Call Tool (Write)"),
-		mcp.WithDestructiveHintAnnotation(false),
-		mcp.WithString("name",
-			mcp.Required(),
-			mcp.Description("Tool name in format 'server:tool' (e.g., 'github:create_issue'). CRITICAL: You MUST use exact names from retrieve_tools results - do NOT guess or invent server names. Unknown servers will fail."),
-		),
-		mcp.WithString("args_json",
-			mcp.Description("Arguments to pass to the tool as JSON string. Refer to the tool's inputSchema from retrieve_tools for required parameters."),
-		),
-		mcp.WithString("intent_data_sensitivity",
-			mcp.Description("Classify data being modified: public, internal, private, or unknown. Helps track sensitive data changes."),
-		),
-		mcp.WithString("intent_reason",
-			mcp.Description("Why is this modification needed? Provide context like 'User requested update' or 'Fixing reported issue'."),
-		),
-	)
+	callToolWriteTool := buildCallToolVariantTool(contracts.ToolVariantWrite)
 	p.server.AddTool(callToolWriteTool, p.handleCallToolWrite)
 
-	// call_tool_destructive - Irreversible operations
-	callToolDestructiveTool := mcp.NewTool(contracts.ToolVariantDestructive,
-		mcp.WithDescription("Execute a DESTRUCTIVE tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. DECISION RULE: Use this when the tool name contains: delete, remove, drop, revoke, disable, destroy, purge, reset, clear, unsubscribe, cancel, terminate, close, archive, ban, block, disconnect, kill, wipe, truncate, force, hard. Examples: delete_repo, remove_user, drop_table, revoke_access, clear_cache, terminate_session. Use for irreversible or high-impact operations."),
-		mcp.WithTitleAnnotation("Call Tool (Destructive)"),
-		mcp.WithDestructiveHintAnnotation(true),
-		mcp.WithString("name",
-			mcp.Required(),
-			mcp.Description("Tool name in format 'server:tool' (e.g., 'github:delete_repo'). CRITICAL: You MUST use exact names from retrieve_tools results - do NOT guess or invent server names. Unknown servers will fail."),
-		),
-		mcp.WithString("args_json",
-			mcp.Description("Arguments to pass to the tool as JSON string. Refer to the tool's inputSchema from retrieve_tools for required parameters."),
-		),
-		mcp.WithString("intent_data_sensitivity",
-			mcp.Description("Classify data being deleted: public, internal, private, or unknown. Important for tracking destructive operations on sensitive data."),
-		),
-		mcp.WithString("intent_reason",
-			mcp.Description("Why is this deletion needed? Provide justification like 'User confirmed cleanup' or 'Removing obsolete data'."),
-		),
-	)
+	callToolDestructiveTool := buildCallToolVariantTool(contracts.ToolVariantDestructive)
 	p.server.AddTool(callToolDestructiveTool, p.handleCallToolDestructive)
 
 	// read_cache - Access paginated data when responses are truncated
@@ -441,6 +528,8 @@ func (p *MCPProxyServer) registerTools(_ bool) {
 		mcp.WithDescription("Retrieve paginated data when mcpproxy indicates a tool response was truncated. Use the cache key provided in truncation messages to access the complete dataset with pagination."),
 		mcp.WithTitleAnnotation("Read Cache"),
 		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
 		mcp.WithString("key",
 			mcp.Required(),
 			mcp.Description("Cache key provided by mcpproxy when a response was truncated (e.g. 'Use read_cache tool: key=\"abc123def...\"')"),
@@ -460,6 +549,8 @@ func (p *MCPProxyServer) registerTools(_ bool) {
 			mcp.WithDescription("Execute JavaScript or TypeScript code that orchestrates multiple upstream MCP tools in a single request. Use this when you need to combine results from 2+ tools, implement conditional logic, loops, or data transformations that would require multiple round-trips otherwise.\n\n**When to use**: Multi-step workflows with data transformation, conditional logic, error handling, or iterating over results.\n**When NOT to use**: Single tool calls (use call_tool directly), long-running operations (>2 minutes).\n\n**Available in code**:\n- `input` global: Your input data passed via the 'input' parameter\n- `call_tool(serverName, toolName, args)`: Call upstream tools (returns {ok, result} or {ok, error})\n- Modern JavaScript (ES2020+): arrow functions, const/let, template literals, destructuring, classes, for-of, optional chaining (?.), nullish coalescing (??), spread/rest, Promises, Symbols, Map/Set, Proxy/Reflect (no require(), filesystem, or network access)\n\n**TypeScript support**: Set `language: \"typescript\"` to write TypeScript code with type annotations, interfaces, enums, and generics. Types are automatically stripped before execution.\n\n**Important runtime rules**:\n- `call_tool` is strictly SYNCHRONOUS. Do not use `await`.\n- Upstream tools usually return an MCP content array. To parse JSON results: `const data = JSON.parse(res.result.content[0].text);`\n- The last evaluated expression in your script is automatically returned as the final output.\n\n**Security**: Sandboxed execution with timeout enforcement. Respects existing quarantine and server restrictions."),
 			mcp.WithTitleAnnotation("Code Execution"),
 			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(true),
 			mcp.WithString("code",
 				mcp.Required(),
 				mcp.Description("JavaScript or TypeScript source code (ES2020+) to execute. Supports modern syntax: arrow functions, const/let, template literals, destructuring, optional chaining, nullish coalescing. Use `input` to access input data and `call_tool(serverName, toolName, args)` to invoke upstream tools. call_tool is SYNCHRONOUS — do not use await. Return value is the last evaluated expression and must be JSON-serializable. Example: `const res = call_tool('github', 'get_user', {username: input.username}); const data = JSON.parse(res.result.content[0].text); ({user: data, timestamp: Date.now()})`"),
@@ -497,6 +588,8 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 			mcp.WithDescription("Manage upstream MCP servers - add, remove, update, and list servers. Includes Docker isolation configuration and connection status monitoring. SECURITY: Newly added servers are automatically quarantined to prevent Tool Poisoning Attacks (TPAs). Use 'quarantine_security' tool to review and manage quarantined servers. NOTE: Unquarantining servers is only available through manual config editing or system tray UI for security.\n\nDocker Isolation: Use 'isolation_json' parameter to configure per-server Docker images, CPU/memory limits, and network isolation. Example: {\"enabled\": true, \"image\": \"node:20\", \"network_mode\": \"bridge\"}.\n\nSMART PATCHING (update/patch): Uses deep merge - only specify fields you want to change. Omitted fields are PRESERVED, not removed. Examples:\n- Enable server: {\"operation\": \"patch\", \"name\": \"my-server\", \"enabled\": true} - only enabled changes\n- Enable isolation: {\"operation\": \"patch\", \"name\": \"my-server\", \"isolation_json\": \"{\\\"enabled\\\": true}\"} - enables isolation with defaults\n- Update image: {\"operation\": \"patch\", \"name\": \"my-server\", \"isolation_json\": \"{\\\"image\\\": \\\"python:3.12\\\"}\"} - other isolation fields preserved\n- Add env var: env_json merges with existing vars\n- Replace args: args_json replaces entirely (arrays not merged)\n- Remove field: use 'null' (e.g., isolation_json: \"null\" removes isolation)"),
 			mcp.WithTitleAnnotation("Upstream Servers"),
 			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
 			mcp.WithString("operation",
 				mcp.Required(),
 				mcp.Description("Operation: list, add, remove, update, patch, tail_log. 'update' and 'patch' use smart merge - only specified fields change, others preserved. For quarantine operations, use the 'quarantine_security' tool."),
@@ -546,6 +639,8 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 			mcp.WithDescription("Security quarantine management for MCP servers and tools. Review and manage quarantined servers and tools to prevent Tool Poisoning Attacks (TPAs). Supports server-level quarantine and tool-level approval for individual tool description/schema changes. NOTE: Unquarantining servers is only available through manual config editing or system tray UI for security."),
 			mcp.WithTitleAnnotation("Quarantine Security"),
 			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
 			mcp.WithString("operation",
 				mcp.Required(),
 				mcp.Description("Security operation: list_quarantined, inspect_quarantined, quarantine_server, inspect_tools, approve_tool, approve_all_tools"),
@@ -567,6 +662,8 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 			mcp.WithDescription("🔍 Discover MCP servers from known registries with repository type detection. Search and filter servers from embedded registry list to find new MCP servers that can be added as upstreams. Features npm/PyPI package detection for enhanced install commands. WORKFLOW: 1) Call 'list_registries' first to see available registries, 2) Use this tool with a registry ID to search servers. Results include server URLs and repository information ready for direct use with upstream_servers add command."),
 			mcp.WithTitleAnnotation("Search Servers"),
 			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(true),
 			mcp.WithString("registry",
 				mcp.Required(),
 				mcp.Description("Registry ID or name to search (e.g., 'smithery', 'mcprun', 'pulse'). Use 'list_registries' tool first to see available registries."),
@@ -590,6 +687,8 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 			mcp.WithDescription("📋 List all available MCP registries. Use this FIRST to discover which registries you can search with the 'search_servers' tool. Each registry contains different collections of MCP servers that can be added as upstreams."),
 			mcp.WithTitleAnnotation("List Registries"),
 			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
 		)
 		tools = append(tools, mcpserver.ServerTool{Tool: listRegistriesTool, Handler: p.handleListRegistries})
 	}
@@ -732,7 +831,7 @@ func (p *MCPProxyServer) handleSearchServers(ctx context.Context, request mcp.Ca
 
 	registry, err := request.RequireString("registry")
 	if err != nil {
-		p.emitActivityInternalToolCall("search_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil)
+		p.emitActivityInternalToolCall("search_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'registry': %v", err)), nil
 	}
 
@@ -767,7 +866,7 @@ func (p *MCPProxyServer) handleSearchServers(ctx context.Context, request mcp.Ca
 			zap.String("search", search),
 			zap.String("tag", tag),
 			zap.Error(err))
-		p.emitActivityInternalToolCall("search_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("search_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
 	}
 
@@ -791,12 +890,12 @@ func (p *MCPProxyServer) handleSearchServers(ctx context.Context, request mcp.Ca
 
 	jsonResult, err := json.Marshal(response)
 	if err != nil {
-		p.emitActivityInternalToolCall("search_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("search_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize results: %v", err)), nil
 	}
 
 	// Spec 024: Emit success event with args and response
-	p.emitActivityInternalToolCall("search_servers", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, response, nil)
+	p.emitActivityInternalToolCall("search_servers", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, response, nil, "")
 
 	return mcp.NewToolResultText(string(jsonResult)), nil
 }
@@ -834,12 +933,12 @@ func (p *MCPProxyServer) handleListRegistries(ctx context.Context, _ mcp.CallToo
 
 	jsonResult, err := json.Marshal(response)
 	if err != nil {
-		p.emitActivityInternalToolCall("list_registries", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil)
+		p.emitActivityInternalToolCall("list_registries", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize registries: %v", err)), nil
 	}
 
 	// Spec 024: Emit success event with response
-	p.emitActivityInternalToolCall("list_registries", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), nil, response, nil)
+	p.emitActivityInternalToolCall("list_registries", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), nil, response, nil, "")
 
 	return mcp.NewToolResultText(string(jsonResult)), nil
 }
@@ -861,6 +960,17 @@ func (p *MCPProxyServer) handleRetrieveTools(ctx context.Context, request mcp.Ca
 
 // handleRetrieveToolsWithMode implements the retrieve_tools functionality with mode-aware instructions.
 func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, request mcp.CallToolRequest, routingMode string) (*mcp.CallToolResult, error) {
+	// Spec 042: telemetry counters.
+	p.recordMCPSurface()
+	p.recordBuiltinTool("retrieve_tools")
+
+	// Spec 044 (T039): activation funnel — bump the 24h retrieve_tools
+	// counter and mark the first-ever-call flag. Plumbed via runtime so the
+	// handler stays unaware of BBolt. nil-safe.
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		p.mainServer.runtime.RecordRetrieveToolsCallForActivation()
+	}
+
 	startTime := time.Now()
 
 	// Extract session info for activity logging (Spec 024)
@@ -873,7 +983,7 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	query, err := request.RequireString("query")
 	if err != nil {
 		// Emit internal tool call event for error case
-		p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil)
+		p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'query': %v", err)), nil
 	}
 
@@ -882,6 +992,11 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	includeStats := request.GetBool("include_stats", false)
 	debugMode := request.GetBool("debug", false)
 	explainTool := request.GetString("explain_tool", "")
+
+	// Spec 035 F4: Annotation-based filtering parameters
+	readOnlyOnly := request.GetBool("read_only_only", false)
+	excludeDestructive := request.GetBool("exclude_destructive", false)
+	excludeOpenWorld := request.GetBool("exclude_open_world", false)
 
 	// Build arguments map for activity logging (Spec 024)
 	args := map[string]interface{}{
@@ -897,6 +1012,15 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	if explainTool != "" {
 		args["explain_tool"] = explainTool
 	}
+	if readOnlyOnly {
+		args["read_only_only"] = true
+	}
+	if excludeDestructive {
+		args["exclude_destructive"] = true
+	}
+	if excludeOpenWorld {
+		args["exclude_open_world"] = true
+	}
 
 	// Validate limit
 	if limit > 100 {
@@ -907,7 +1031,7 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	results, err := p.index.Search(query, limit)
 	if err != nil {
 		p.logger.Error("Search failed", zap.String("query", query), zap.Error(err))
-		p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
 	}
 
@@ -927,6 +1051,40 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 			}
 		}
 		results = filtered
+	}
+
+	// Spec 035 F4: Resolve annotations for each result and apply annotation-based filtering
+	// before building the MCP tool response. This allows agents to self-restrict discovery.
+	annotationFilterActive := readOnlyOnly || excludeDestructive || excludeOpenWorld
+	if annotationFilterActive {
+		var annotatedResults []annotatedSearchResult
+		for i, result := range results {
+			serverName := result.Tool.ServerName
+			toolName := result.Tool.Name
+			if serverName == "" {
+				if parts := strings.SplitN(result.Tool.Name, ":", 2); len(parts) == 2 {
+					serverName = parts[0]
+					toolName = parts[1]
+				}
+			}
+			var annotations *config.ToolAnnotations
+			if serverName != "" {
+				annotations = p.lookupToolAnnotations(serverName, toolName)
+			}
+			annotatedResults = append(annotatedResults, annotatedSearchResult{
+				serverName:  serverName,
+				toolName:    toolName,
+				annotations: annotations,
+				resultIndex: i,
+			})
+		}
+
+		filtered := filterByAnnotations(annotatedResults, readOnlyOnly, excludeDestructive, excludeOpenWorld)
+		var filteredResults []*config.SearchResult
+		for _, ar := range filtered {
+			filteredResults = append(filteredResults, results[ar.resultIndex])
+		}
+		results = filteredResults
 	}
 
 	// Convert results to MCP tool format for LLM compatibility
@@ -995,6 +1153,22 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		mcpTools = append(mcpTools, mcpTool)
 	}
 
+	// Spec 044 (T039): estimate tokens saved by NOT exposing the full catalog.
+	// Assumption (documented here so it's easy to tune): every tool schema
+	// that mcpproxy hides from the client costs ~150 tokens if it were
+	// inlined. We count "hidden" as (total_indexed - results_returned) and
+	// clamp to 0. This is deliberately rough — the bucketing in the payload
+	// (see BucketTokens) absorbs an order-of-magnitude variance per FR-009.
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		total := p.getIndexedToolCount()
+		exposed := len(mcpTools)
+		hidden := total - exposed
+		if hidden > 0 {
+			const avgTokensPerToolSchema = 150
+			p.mainServer.runtime.RecordTokensSavedForActivation(hidden * avgTokensPerToolSchema)
+		}
+	}
+
 	// Build mode-aware usage instructions
 	var usageInstructions string
 	switch routingMode {
@@ -1018,6 +1192,30 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		"query":              query,
 		"total":              len(results),
 		"usage_instructions": usageInstructions,
+	}
+
+	// Spec 035 F2: Session risk analysis — analyze all connected servers' tool annotations
+	// to detect the "lethal trifecta" risk combination.
+	//
+	// The structured fields (level, lethal_trifecta, has_*) are always returned.
+	// The prose `warning` string is opt-in (issue #406): include it only when
+	// `tool_response_session_risk_warning` is true in config OR when the caller
+	// explicitly opts in via the `include_session_risk_warning` argument. This
+	// avoids burning tokens and distracting LLMs on every call in trusted setups,
+	// since most tools lack annotations and trigger the trifecta by default.
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		if sup := p.mainServer.runtime.Supervisor(); sup != nil {
+			snapshot := sup.StateView().Snapshot()
+			risk := analyzeSessionRisk(snapshot)
+			includeWarning := false
+			if p.config != nil && p.config.ToolResponseSessionRiskWarning {
+				includeWarning = true
+			}
+			if request.GetBool("include_session_risk_warning", false) {
+				includeWarning = true
+			}
+			response["session_risk"] = buildSessionRiskResponse(risk, includeWarning)
+		}
 	}
 
 	// Add debug information if requested
@@ -1050,33 +1248,42 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 
 	jsonResult, err := json.Marshal(response)
 	if err != nil {
-		p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), activityArgs, nil, nil)
+		p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), activityArgs, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize results: %v", err)), nil
 	}
 
 	// Emit success event with args and response (Spec 024)
-	p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), activityArgs, response, nil)
+	p.emitActivityInternalToolCall("retrieve_tools", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), activityArgs, response, nil, "")
 
 	return mcp.NewToolResultText(string(jsonResult)), nil
 }
 
 // handleCallToolRead implements the call_tool_read functionality (Spec 018)
 func (p *MCPProxyServer) handleCallToolRead(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	p.recordBuiltinTool("call_tool_read")
 	return p.handleCallToolVariant(ctx, request, contracts.ToolVariantRead)
 }
 
 // handleCallToolWrite implements the call_tool_write functionality (Spec 018)
 func (p *MCPProxyServer) handleCallToolWrite(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	p.recordBuiltinTool("call_tool_write")
 	return p.handleCallToolVariant(ctx, request, contracts.ToolVariantWrite)
 }
 
 // handleCallToolDestructive implements the call_tool_destructive functionality (Spec 018)
 func (p *MCPProxyServer) handleCallToolDestructive(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	p.recordBuiltinTool("call_tool_destructive")
 	return p.handleCallToolVariant(ctx, request, contracts.ToolVariantDestructive)
 }
 
 // handleCallToolVariant is the common handler for all call_tool_* variants (Spec 018)
 func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.CallToolRequest, toolVariant string) (callResult *mcp.CallToolResult, callErr error) {
+	// Spec 042: every call_tool_* invocation is an MCP request, and the actual
+	// upstream call happens inside this function — we count it as an upstream
+	// tool call (no name recorded).
+	p.recordMCPSurface()
+	p.recordUpstreamTool()
+
 	// Spec 024: Track start time and context for internal tool call logging
 	internalStartTime := time.Now()
 
@@ -1214,6 +1421,15 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// Look up tool annotations from StateView for server annotation validation
 	annotations := p.lookupToolAnnotations(serverName, actualToolName)
 
+	// Spec 035: Determine content trust level based on openWorldHint annotation
+	contentTrust := contracts.ContentTrustForTool(annotations)
+	if contentTrust == contracts.ContentTrustUntrusted {
+		p.logger.Debug("handleCallToolVariant: open-world tool detected, tagging as untrusted",
+			zap.String("server_name", serverName),
+			zap.String("tool_name", actualToolName),
+			zap.String("content_trust", contentTrust))
+	}
+
 	// Validate intent against server annotations (unless call_tool_destructive which is most permissive)
 	if errResult := p.validateIntentAgainstServer(intent, toolVariant, serverName, actualToolName, annotations); errResult != nil {
 		// Record activity error for server annotation mismatch
@@ -1331,7 +1547,7 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 				intentMap = intent.ToMap()
 			}
 			p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-			p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap)
+			p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap, contentTrust)
 			return mcp.NewToolResultError(errMsg), nil
 		}
 	} else {
@@ -1356,7 +1572,7 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 			intentMap = intent.ToMap()
 		}
 		p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap)
+		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, toolVariant, intentMap, contentTrust)
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
@@ -1453,11 +1669,11 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		if intent != nil {
 			intentMap = intent.ToMap()
 		}
-		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", err.Error(), duration.Milliseconds(), activityArgs, "", false, toolVariant, intentMap)
+		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", err.Error(), duration.Milliseconds(), activityArgs, "", false, toolVariant, intentMap, contentTrust)
 
 		// Spec 024: Emit internal tool call event for error
 		internalToolName := "call_tool_" + intent.OperationType // e.g., "call_tool_read"
-		p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "error", err.Error(), time.Since(internalStartTime).Milliseconds(), activityArgs, nil, intentMap)
+		p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "error", err.Error(), time.Since(internalStartTime).Milliseconds(), activityArgs, nil, intentMap, "")
 
 		return p.createDetailedErrorResponse(err, serverName, actualToolName), nil
 	}
@@ -1485,60 +1701,22 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		p.logger.Warn("Failed to update tool stats", zap.String("tool_name", toolName), zap.Error(err))
 	}
 
-	// Convert result to JSON string
-	jsonResult, err := json.Marshal(result)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize result: %v", err)), nil
-	}
+	// Forward content blocks (preserving ImageContent, AudioContent, etc.)
+	// while applying truncation only to TextContent. See issue #368.
+	forwarded, response, wasTruncated := forwardContentResult(result, p.truncator, toolName, args)
 
-	response := string(jsonResult)
-
-	// Apply truncation if configured
-	if p.truncator.ShouldTruncate(response) {
-		truncResult := p.truncator.Truncate(response, toolName, args)
-
-		// Track truncation in token metrics
-		if tokenMetrics != nil && p.mainServer != nil && p.mainServer.runtime != nil {
-			tokenizer := p.mainServer.runtime.Tokenizer()
-			if tokenizer != nil {
-				// Count tokens in original response
-				originalTokens, err := tokenizer.CountTokensForModel(response, tokenMetrics.Model)
-				if err == nil {
-					// Count tokens in truncated response
-					truncatedTokens, err := tokenizer.CountTokensForModel(truncResult.TruncatedContent, tokenMetrics.Model)
-					if err == nil {
-						tokenMetrics.WasTruncated = true
-						tokenMetrics.TruncatedTokens = originalTokens - truncatedTokens
-						// Update output tokens to reflect truncated size
-						tokenMetrics.OutputTokens = truncatedTokens
-						tokenMetrics.TotalTokens = tokenMetrics.InputTokens + tokenMetrics.OutputTokens
-						toolCallRecord.Metrics = tokenMetrics
-					}
-				}
+	// Track truncation in token metrics
+	if wasTruncated && tokenMetrics != nil && p.mainServer != nil && p.mainServer.runtime != nil {
+		tokenizer := p.mainServer.runtime.Tokenizer()
+		if tokenizer != nil {
+			truncatedTokens, err := tokenizer.CountTokensForModel(response, tokenMetrics.Model)
+			if err == nil {
+				tokenMetrics.WasTruncated = true
+				tokenMetrics.OutputTokens = truncatedTokens
+				tokenMetrics.TotalTokens = tokenMetrics.InputTokens + tokenMetrics.OutputTokens
+				toolCallRecord.Metrics = tokenMetrics
 			}
 		}
-
-		// If caching is available, store the full response
-		if truncResult.CacheAvailable {
-			if err := p.cacheManager.Store(
-				truncResult.CacheKey,
-				toolName,
-				args,
-				response,
-				truncResult.RecordPath,
-				truncResult.TotalRecords,
-			); err != nil {
-				p.logger.Error("Failed to cache response",
-					zap.String("tool_name", toolName),
-					zap.String("cache_key", truncResult.CacheKey),
-					zap.Error(err))
-				// Fall back to simple truncation if caching fails
-				truncResult.TruncatedContent = p.truncator.Truncate(response, toolName, args).TruncatedContent
-				truncResult.CacheAvailable = false
-			}
-		}
-
-		response = truncResult.TruncatedContent
 	}
 
 	// Store successful tool call in history
@@ -1557,13 +1735,13 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	if intent != nil {
 		intentMap = intent.ToMap()
 	}
-	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "success", "", duration.Milliseconds(), activityArgs, response, responseTruncated, toolVariant, intentMap)
+	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "success", "", duration.Milliseconds(), activityArgs, response, responseTruncated, toolVariant, intentMap, contentTrust)
 
 	// Spec 024: Emit internal tool call event for success
 	internalToolName := "call_tool_" + intent.OperationType // e.g., "call_tool_read"
-	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "success", "", time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap)
+	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "success", "", time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap, "")
 
-	return mcp.NewToolResultText(response), nil
+	return forwarded, nil
 }
 
 // handleCallTool is the LEGACY call_tool handler - returns error directing to new variants (Spec 018)
@@ -1730,7 +1908,7 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 			}
 			// Log the early failure to activity (Spec 024)
 			p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-			p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil)
+			p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil, "")
 			return mcp.NewToolResultError(errMsg), nil
 		}
 	} else {
@@ -1739,7 +1917,7 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 		errMsg := fmt.Sprintf("No client found for server: %s", serverName)
 		// Log the early failure to activity (Spec 024)
 		p.emitActivityToolCallStarted(serverName, actualToolName, sessionID, requestID, activitySource, activityArgs)
-		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil)
+		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", errMsg, 0, activityArgs, errMsg, false, "", nil, "")
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
@@ -1857,7 +2035,7 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 		}
 
 		// Emit activity completed event for error with determined source (legacy - no intent)
-		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", err.Error(), duration.Milliseconds(), activityArgs, "", false, "", nil)
+		p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "error", err.Error(), duration.Milliseconds(), activityArgs, "", false, "", nil, "")
 
 		return p.createDetailedErrorResponse(err, serverName, actualToolName), nil
 	}
@@ -1885,60 +2063,22 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 		p.logger.Warn("Failed to update tool stats", zap.String("tool_name", toolName), zap.Error(err))
 	}
 
-	// Convert result to JSON string
-	jsonResult, err := json.Marshal(result)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize result: %v", err)), nil
-	}
+	// Forward content blocks (preserving ImageContent, AudioContent, etc.)
+	// while applying truncation only to TextContent. See issue #368.
+	forwarded, response, wasTruncated := forwardContentResult(result, p.truncator, toolName, args)
 
-	response := string(jsonResult)
-
-	// Apply truncation if configured
-	if p.truncator.ShouldTruncate(response) {
-		truncResult := p.truncator.Truncate(response, toolName, args)
-
-		// Track truncation in token metrics
-		if tokenMetrics != nil && p.mainServer != nil && p.mainServer.runtime != nil {
-			tokenizer := p.mainServer.runtime.Tokenizer()
-			if tokenizer != nil {
-				// Count tokens in original response
-				originalTokens, err := tokenizer.CountTokensForModel(response, tokenMetrics.Model)
-				if err == nil {
-					// Count tokens in truncated response
-					truncatedTokens, err := tokenizer.CountTokensForModel(truncResult.TruncatedContent, tokenMetrics.Model)
-					if err == nil {
-						tokenMetrics.WasTruncated = true
-						tokenMetrics.TruncatedTokens = originalTokens - truncatedTokens
-						// Update output tokens to reflect truncated size
-						tokenMetrics.OutputTokens = truncatedTokens
-						tokenMetrics.TotalTokens = tokenMetrics.InputTokens + tokenMetrics.OutputTokens
-						toolCallRecord.Metrics = tokenMetrics
-					}
-				}
+	// Track truncation in token metrics
+	if wasTruncated && tokenMetrics != nil && p.mainServer != nil && p.mainServer.runtime != nil {
+		tokenizer := p.mainServer.runtime.Tokenizer()
+		if tokenizer != nil {
+			truncatedTokens, err := tokenizer.CountTokensForModel(response, tokenMetrics.Model)
+			if err == nil {
+				tokenMetrics.WasTruncated = true
+				tokenMetrics.OutputTokens = truncatedTokens
+				tokenMetrics.TotalTokens = tokenMetrics.InputTokens + tokenMetrics.OutputTokens
+				toolCallRecord.Metrics = tokenMetrics
 			}
 		}
-
-		// If caching is available, store the full response
-		if truncResult.CacheAvailable {
-			if err := p.cacheManager.Store(
-				truncResult.CacheKey,
-				toolName,
-				args,
-				response,
-				truncResult.RecordPath,
-				truncResult.TotalRecords,
-			); err != nil {
-				p.logger.Error("Failed to cache response",
-					zap.String("tool_name", toolName),
-					zap.String("cache_key", truncResult.CacheKey),
-					zap.Error(err))
-				// Fall back to simple truncation if caching fails
-				truncResult.TruncatedContent = p.truncator.Truncate(response, toolName, args).TruncatedContent
-				truncResult.CacheAvailable = false
-			}
-		}
-
-		response = truncResult.TruncatedContent
 	}
 
 	// Store successful tool call in history
@@ -1953,9 +2093,9 @@ func (p *MCPProxyServer) handleCallTool(ctx context.Context, request mcp.CallToo
 
 	// Emit activity completed event for success with determined source (legacy - no intent)
 	responseTruncated := tokenMetrics != nil && tokenMetrics.WasTruncated
-	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "success", "", duration.Milliseconds(), activityArgs, response, responseTruncated, "", nil)
+	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "success", "", duration.Milliseconds(), activityArgs, response, responseTruncated, "", nil, "")
 
-	return mcp.NewToolResultText(response), nil
+	return forwarded, nil
 }
 
 // handleQuarantinedToolCall handles tool calls to quarantined servers with security analysis
@@ -2013,6 +2153,8 @@ func (p *MCPProxyServer) handleQuarantinedToolCall(ctx context.Context, serverNa
 
 // handleUpstreamServers implements upstream server management
 func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	p.recordMCPSurface()
+	p.recordBuiltinTool("upstream_servers")
 	startTime := time.Now()
 
 	// Extract session info for activity logging (Spec 024)
@@ -2024,7 +2166,7 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 
 	operation, err := request.RequireString("operation")
 	if err != nil {
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil)
+		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'operation': %v", err)), nil
 	}
 
@@ -2039,13 +2181,13 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 	// Security checks
 	if p.config.ReadOnlyMode {
 		if operation != operationList {
-			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Operation not allowed in read-only mode", time.Since(startTime).Milliseconds(), args, nil, nil)
+			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Operation not allowed in read-only mode", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 			return mcp.NewToolResultError("Operation not allowed in read-only mode"), nil
 		}
 	}
 
 	if p.config.DisableManagement {
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Server management is disabled for security", time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Server management is disabled for security", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError("Server management is disabled for security"), nil
 	}
 
@@ -2053,12 +2195,12 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 	switch operation {
 	case operationAdd:
 		if !p.config.AllowServerAdd {
-			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Adding servers is not allowed", time.Since(startTime).Milliseconds(), args, nil, nil)
+			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Adding servers is not allowed", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 			return mcp.NewToolResultError("Adding servers is not allowed"), nil
 		}
 	case operationRemove:
 		if !p.config.AllowServerRemove {
-			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Removing servers is not allowed", time.Since(startTime).Milliseconds(), args, nil, nil)
+			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", "Removing servers is not allowed", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 			return mcp.NewToolResultError("Removing servers is not allowed"), nil
 		}
 	}
@@ -2068,7 +2210,7 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 		switch operation {
 		case operationAdd, operationRemove, "update", "patch", "enable", "disable", "restart":
 			errMsg := fmt.Sprintf("Agent tokens cannot perform '%s' operations on upstream servers", operation)
-			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil)
+			p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
 			return mcp.NewToolResultError(errMsg), nil
 		}
 	}
@@ -2097,7 +2239,7 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 	case "restart":
 		result, opErr = p.handleRestartUpstream(ctx, request)
 	default:
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", fmt.Sprintf("Unknown operation: %s", operation), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", fmt.Sprintf("Unknown operation: %s", operation), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Unknown operation: %s", operation)), nil
 	}
 
@@ -2111,16 +2253,16 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 
 	// Spec 024: Emit activity event based on result with args and response
 	if opErr != nil {
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", opErr.Error(), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", opErr.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 	} else if result != nil && result.IsError {
 		// Extract error message from result if available
 		errMsg := "operation failed"
 		if responseText != "" {
 			errMsg = responseText
 		}
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
 	} else {
-		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, responseText, nil)
+		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, responseText, nil, "")
 	}
 
 	return result, opErr
@@ -2128,6 +2270,8 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 
 // handleQuarantineSecurity implements the quarantine_security functionality
 func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	p.recordMCPSurface()
+	p.recordBuiltinTool("quarantine_security")
 	startTime := time.Now()
 
 	// Extract session info for activity logging (Spec 024)
@@ -2139,7 +2283,7 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 
 	operation, err := request.RequireString("operation")
 	if err != nil {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil)
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'operation': %v", err)), nil
 	}
 
@@ -2154,18 +2298,18 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 	// Spec 028: Agent tokens cannot perform quarantine operations
 	if authCtx := auth.AuthContextFromContext(ctx); authCtx != nil && !authCtx.IsAdmin() {
 		errMsg := "Agent tokens cannot perform quarantine security operations"
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Security checks
 	if p.config.ReadOnlyMode {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", "Quarantine operations not allowed in read-only mode", time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", "Quarantine operations not allowed in read-only mode", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError("Quarantine operations not allowed in read-only mode"), nil
 	}
 
 	if p.config.DisableManagement {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", "Server management is disabled for security", time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", "Server management is disabled for security", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError("Server management is disabled for security"), nil
 	}
 
@@ -2191,7 +2335,7 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 	case "approve_all_tools":
 		result, opErr = p.handleApproveAllToolsByServer(request)
 	default:
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", fmt.Sprintf("Unknown quarantine operation: %s", operation), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", fmt.Sprintf("Unknown quarantine operation: %s", operation), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Unknown quarantine operation: %s", operation)), nil
 	}
 
@@ -2205,16 +2349,16 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 
 	// Spec 024: Emit activity event based on result with args and response
 	if opErr != nil {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", opErr.Error(), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", opErr.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 	} else if result != nil && result.IsError {
 		// Extract error message from result if available
 		errMsg := "operation failed"
 		if responseText != "" {
 			errMsg = responseText
 		}
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
 	} else {
-		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, responseText, nil)
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, responseText, nil, "")
 	}
 
 	return result, opErr
@@ -2615,7 +2759,13 @@ func (p *MCPProxyServer) checkDockerAvailable() bool {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "docker", "info")
+	// Resolve docker via shellwrap so tray-launched processes with a minimal
+	// inherited PATH still find Docker Desktop / Homebrew / Colima installs.
+	dockerBin, resolveErr := shellwrap.ResolveDockerPath(p.logger)
+	if resolveErr != nil || dockerBin == "" {
+		dockerBin = "docker"
+	}
+	cmd := exec.CommandContext(ctx, dockerBin, "info")
 
 	err := cmd.Run()
 	available := err == nil
@@ -3019,7 +3169,18 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 	url := request.GetString("url", "")
 	command := request.GetString("command", "")
 	enabled := request.GetBool("enabled", true)
-	quarantined := request.GetBool("quarantined", true) // Default to quarantined for security
+
+	// Default quarantine follows the global quarantine_enabled flag
+	// (issue #370). Secure by default: true unless the operator has
+	// explicitly set quarantine_enabled=false. An explicit quarantined
+	// field in the request still wins over the default.
+	defaultQuarantined := true
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		if cfg := p.mainServer.runtime.Config(); cfg != nil {
+			defaultQuarantined = cfg.DefaultQuarantineForNewServer()
+		}
+	}
+	quarantined := request.GetBool("quarantined", defaultQuarantined)
 
 	// Must have either URL or command
 	if url == "" && command == "" {
@@ -3557,10 +3718,18 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 		patch.Enabled = requestedEnabled
 	}
 
-	// Handle quarantined similarly
+	// Handle quarantined — only allow quarantining (true→true or false→true), NEVER unquarantine.
+	// Unquarantining via MCP is a security risk: a compromised AI agent could unquarantine
+	// a malicious server. Unquarantine is only available via REST API or config editing.
 	requestedQuarantined := request.GetBool("quarantined", existingServer.Quarantined)
 	if requestedQuarantined != existingServer.Quarantined {
-		patch.Quarantined = requestedQuarantined
+		if !requestedQuarantined && existingServer.Quarantined {
+			p.logger.Warn("MCP tool attempted to unquarantine server (blocked for security)",
+				zap.String("server", existingServer.Name))
+			// Silently ignore — do not update the field
+		} else {
+			patch.Quarantined = requestedQuarantined
+		}
 	}
 
 	// Handle args JSON string - arrays are replaced entirely
@@ -3756,7 +3925,7 @@ func (p *MCPProxyServer) handleReadCache(ctx context.Context, request mcp.CallTo
 
 	key, err := request.RequireString("key")
 	if err != nil {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil)
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), nil, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Missing required parameter 'key': %v", err)), nil
 	}
 
@@ -3773,30 +3942,30 @@ func (p *MCPProxyServer) handleReadCache(ctx context.Context, request mcp.CallTo
 
 	// Validate parameters
 	if offset < 0 {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", "Offset must be non-negative", time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", "Offset must be non-negative", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError("Offset must be non-negative"), nil
 	}
 	if limit <= 0 || limit > 1000 {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", "Limit must be between 1 and 1000", time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", "Limit must be between 1 and 1000", time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError("Limit must be between 1 and 1000"), nil
 	}
 
 	// Retrieve cached data
 	response, err := p.cacheManager.GetRecords(key, offset, limit)
 	if err != nil {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to retrieve cached data: %v", err)), nil
 	}
 
 	// Serialize response
 	jsonResult, err := json.Marshal(response)
 	if err != nil {
-		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil)
+		p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "error", err.Error(), time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to serialize response: %v", err)), nil
 	}
 
 	// Spec 024: Emit success event with args and response
-	p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, response, nil)
+	p.emitActivityInternalToolCall("read_cache", "", "", "", sessionID, requestID, "success", "", time.Since(startTime).Milliseconds(), args, response, nil, "")
 
 	return mcp.NewToolResultText(string(jsonResult)), nil
 }

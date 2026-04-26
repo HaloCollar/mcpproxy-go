@@ -77,38 +77,26 @@ if [ -n "$USER" ] && [ "$USER" != "root" ]; then
     fi
 fi
 
-# 4. Create LaunchAgent for auto-start (optional)
-LAUNCH_AGENT_DIR="/Library/LaunchAgents"
-LAUNCH_AGENT_FILE="$LAUNCH_AGENT_DIR/com.smartmcpproxy.mcpproxy.plist"
-
-mkdir -p "$LAUNCH_AGENT_DIR"
-
-# Create LaunchAgent plist file
-cat > "$LAUNCH_AGENT_FILE" << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.smartmcpproxy.mcpproxy</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Applications/mcpproxy.app/Contents/MacOS/mcpproxy</string>
-    </array>
-    <key>RunAtLoad</key>
-    <false/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>/tmp/mcpproxy.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/mcpproxy.error</string>
-</dict>
-</plist>
-EOF
-
-chmod 644 "$LAUNCH_AGENT_FILE"
-log "✅ LaunchAgent installed (disabled by default)"
+# 4. Auto-start configuration
+#
+# Auto-start (Launch at Login) is now managed by the macOS tray app via
+# `SMAppService.mainApp` (see native/macos/MCPProxy/MCPProxy/Services/AutoStartService.swift).
+# Users opt in via the first-run dialog or the tray menu's "Launch at Login"
+# toggle — this is the per-user, sandbox-friendly mechanism Apple recommends
+# for GUI tray apps on macOS 13+.
+#
+# Earlier installer versions wrote a system LaunchAgent at
+# /Library/LaunchAgents/com.smartmcpproxy.mcpproxy.plist that was labeled
+# "auto-start" but had RunAtLoad=false and KeepAlive=false (issue #405),
+# so it never actually started anything. Clean it up if present so users
+# upgrading from those builds don't have a stale, misleading plist on disk.
+LEGACY_LAUNCH_AGENT="/Library/LaunchAgents/com.smartmcpproxy.mcpproxy.plist"
+if [ -f "$LEGACY_LAUNCH_AGENT" ]; then
+    log "Removing legacy LaunchAgent left by older installer: $LEGACY_LAUNCH_AGENT"
+    launchctl unload -w "$LEGACY_LAUNCH_AGENT" 2>/dev/null || true
+    rm -f "$LEGACY_LAUNCH_AGENT"
+    log "✅ Legacy LaunchAgent removed (auto-start is now via the tray app's Launch-at-Login toggle)"
+fi
 
 # 5. Linux systemd service (if on Linux)
 if command -v systemctl >/dev/null 2>&1; then
@@ -139,4 +127,57 @@ echo '  }'
 echo ""
 echo "📖 Get started: mcpproxy --help"
 
-exit 0 
+# Spec 044 (T057/T058): launch the tray app tagged as installer-launched so
+# the first telemetry heartbeat reports launch_source=installer. The flag is
+# one-shot (cleared after the first heartbeat) and lives in the BBolt
+# activation bucket, so a crash between install and heartbeat is recovered
+# from on next startup. See packaging/macos/postinstall.sh for the standalone
+# version of this step.
+#
+# Critical: launch via `launchctl asuser <uid> env -i …` so the tray app
+# (and its core child) start in the user's GUI bootstrap context with a
+# clean env. A bare `open -a` from a postinstall script propagates the
+# PKInstallSandbox env (minimal PATH, SHELL=/bin/sh, INSTALLER_*) into the
+# long-running daemon — which broke Docker discovery in mcpproxy core. The
+# clean-env launch mimics what users get when they double-click from Finder.
+APP_BUNDLE=""
+if [ -d "/Applications/MCPProxy.app" ]; then
+    APP_BUNDLE="/Applications/MCPProxy.app"
+elif [ -d "/Applications/mcpproxy.app" ]; then
+    # Some build paths produce the lowercase-named bundle.
+    APP_BUNDLE="/Applications/mcpproxy.app"
+fi
+
+if [ -n "$APP_BUNDLE" ]; then
+    log "Launching mcpproxy tray (installer-tagged) with clean env: $APP_BUNDLE"
+
+    REAL_USER="${USER:-}"
+    if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
+        REAL_USER=$(stat -f%Su /dev/console 2>/dev/null || echo "")
+    fi
+    REAL_UID=""
+    USER_HOME=""
+    if [ -n "$REAL_USER" ]; then
+        REAL_UID=$(id -u "$REAL_USER" 2>/dev/null || echo "")
+        USER_HOME=$(/usr/bin/dscl . -read "/Users/$REAL_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+        [ -z "$USER_HOME" ] && USER_HOME=$(eval echo "~$REAL_USER")
+    fi
+
+    SANE_PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    if [ -n "$REAL_UID" ] && [ "$REAL_UID" != "0" ]; then
+        /bin/launchctl asuser "$REAL_UID" /usr/bin/env -i \
+            HOME="$USER_HOME" \
+            USER="$REAL_USER" \
+            LOGNAME="$REAL_USER" \
+            PATH="$SANE_PATH" \
+            /usr/bin/open -a "$APP_BUNDLE" --env MCPPROXY_LAUNCHED_BY=installer || true
+    else
+        /usr/bin/env -i \
+            HOME="${USER_HOME:-/var/empty}" \
+            PATH="$SANE_PATH" \
+            /usr/bin/open -a "$APP_BUNDLE" --env MCPPROXY_LAUNCHED_BY=installer || true
+    fi
+fi
+
+exit 0

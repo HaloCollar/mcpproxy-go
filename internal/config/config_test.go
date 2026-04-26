@@ -982,6 +982,36 @@ func TestConfig_IsQuarantineEnabled(t *testing.T) {
 	}
 }
 
+func TestConfig_DefaultQuarantineForNewServer(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   Config
+		expected bool
+	}{
+		{
+			name:     "nil pointer: secure by default (true)",
+			config:   Config{QuarantineEnabled: nil},
+			expected: true,
+		},
+		{
+			name:     "explicit true: quarantine new servers",
+			config:   Config{QuarantineEnabled: boolPtr(true)},
+			expected: true,
+		},
+		{
+			name:     "explicit false: auto-approve new servers (issue #370)",
+			config:   Config{QuarantineEnabled: boolPtr(false)},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.config.DefaultQuarantineForNewServer())
+		})
+	}
+}
+
 func TestServerConfig_IsQuarantineSkipped(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1099,4 +1129,230 @@ func TestLoadConfig_DataDirExpandFailure(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, cfg.DataDir, fmt.Sprintf("${env:%s}", missingVar),
 		"original unresolved ref should be retained when expansion fails")
+}
+
+func TestConfig_IsTelemetryEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      *Config
+		envValue string
+		want     bool
+	}{
+		{
+			name: "default (nil telemetry)",
+			cfg:  &Config{},
+			want: true,
+		},
+		{
+			name: "nil enabled (default true)",
+			cfg:  &Config{Telemetry: &TelemetryConfig{}},
+			want: true,
+		},
+		{
+			name: "explicitly enabled",
+			cfg:  &Config{Telemetry: &TelemetryConfig{Enabled: BoolPtr(true)}},
+			want: true,
+		},
+		{
+			name: "explicitly disabled",
+			cfg:  &Config{Telemetry: &TelemetryConfig{Enabled: BoolPtr(false)}},
+			want: false,
+		},
+		{
+			name:     "env var override false",
+			cfg:      &Config{},
+			envValue: "false",
+			want:     false,
+		},
+		{
+			name:     "env var override false beats config enabled",
+			cfg:      &Config{Telemetry: &TelemetryConfig{Enabled: BoolPtr(true)}},
+			envValue: "false",
+			want:     false,
+		},
+		{
+			name:     "env var other value does not disable",
+			cfg:      &Config{},
+			envValue: "true",
+			want:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envValue != "" {
+				t.Setenv("MCPPROXY_TELEMETRY", tt.envValue)
+			} else {
+				os.Unsetenv("MCPPROXY_TELEMETRY") //nolint:errcheck
+			}
+			got := tt.cfg.IsTelemetryEnabled()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestConfig_GetTelemetryEndpoint(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want string
+	}{
+		{
+			name: "default",
+			cfg:  &Config{},
+			want: "https://telemetry.mcpproxy.app/v1",
+		},
+		{
+			name: "custom endpoint",
+			cfg:  &Config{Telemetry: &TelemetryConfig{Endpoint: "https://custom.example.com/v1"}},
+			want: "https://custom.example.com/v1",
+		},
+		{
+			name: "empty endpoint falls back to default",
+			cfg:  &Config{Telemetry: &TelemetryConfig{Endpoint: ""}},
+			want: "https://telemetry.mcpproxy.app/v1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetTelemetryEndpoint()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestConfig_GetAnonymousID(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want string
+	}{
+		{
+			name: "default (nil telemetry)",
+			cfg:  &Config{},
+			want: "",
+		},
+		{
+			name: "set ID",
+			cfg:  &Config{Telemetry: &TelemetryConfig{AnonymousID: "abc-123"}},
+			want: "abc-123",
+		},
+		{
+			name: "empty ID",
+			cfg:  &Config{Telemetry: &TelemetryConfig{AnonymousID: ""}},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetAnonymousID()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestTelemetryConfig_JSONSerialization(t *testing.T) {
+	// Test that TelemetryConfig serializes/deserializes correctly
+	enabled := true
+	cfg := &Config{
+		Listen: "127.0.0.1:8080",
+		Telemetry: &TelemetryConfig{
+			Enabled:     &enabled,
+			AnonymousID: "test-uuid",
+			Endpoint:    "https://custom.example.com/v1",
+		},
+	}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var restored Config
+	err = json.Unmarshal(data, &restored)
+	require.NoError(t, err)
+
+	require.NotNil(t, restored.Telemetry)
+	require.NotNil(t, restored.Telemetry.Enabled)
+	assert.Equal(t, true, *restored.Telemetry.Enabled)
+	assert.Equal(t, "test-uuid", restored.Telemetry.AnonymousID)
+	assert.Equal(t, "https://custom.example.com/v1", restored.Telemetry.Endpoint)
+}
+
+func TestTelemetryConfig_OmittedWhenNil(t *testing.T) {
+	cfg := &Config{
+		Listen: "127.0.0.1:8080",
+	}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	// telemetry should not appear in JSON when nil
+	assert.NotContains(t, string(data), "telemetry")
+}
+
+func TestServerConfig_ReconnectOnUse(t *testing.T) {
+	t.Run("defaults to false", func(t *testing.T) {
+		server := &ServerConfig{
+			Name:    "test-server",
+			Enabled: true,
+		}
+		assert.False(t, server.ReconnectOnUse)
+	})
+
+	t.Run("parses from JSON when true", func(t *testing.T) {
+		jsonStr := `{"name":"test","enabled":true,"reconnect_on_use":true}`
+		var server ServerConfig
+		err := json.Unmarshal([]byte(jsonStr), &server)
+		require.NoError(t, err)
+		assert.True(t, server.ReconnectOnUse)
+	})
+
+	t.Run("parses from JSON when false", func(t *testing.T) {
+		jsonStr := `{"name":"test","enabled":true,"reconnect_on_use":false}`
+		var server ServerConfig
+		err := json.Unmarshal([]byte(jsonStr), &server)
+		require.NoError(t, err)
+		assert.False(t, server.ReconnectOnUse)
+	})
+
+	t.Run("omitted from JSON when false", func(t *testing.T) {
+		server := &ServerConfig{
+			Name:           "test",
+			Enabled:        true,
+			ReconnectOnUse: false,
+		}
+		data, err := json.Marshal(server)
+		require.NoError(t, err)
+		assert.NotContains(t, string(data), "reconnect_on_use")
+	})
+
+	t.Run("present in JSON when true", func(t *testing.T) {
+		server := &ServerConfig{
+			Name:           "test",
+			Enabled:        true,
+			ReconnectOnUse: true,
+		}
+		data, err := json.Marshal(server)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"reconnect_on_use":true`)
+	})
+
+	t.Run("round-trip serialization", func(t *testing.T) {
+		server := &ServerConfig{
+			Name:           "reconnect-test",
+			URL:            "http://localhost:3000",
+			Protocol:       "http",
+			Enabled:        true,
+			ReconnectOnUse: true,
+			Created:        time.Now(),
+		}
+		data, err := json.Marshal(server)
+		require.NoError(t, err)
+
+		var restored ServerConfig
+		err = json.Unmarshal(data, &restored)
+		require.NoError(t, err)
+		assert.Equal(t, server.ReconnectOnUse, restored.ReconnectOnUse)
+	})
 }

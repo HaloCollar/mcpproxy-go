@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security/scanner"
 
 	"go.etcd.io/bbolt"
 	bboltErrors "go.etcd.io/bbolt/errors"
@@ -84,21 +85,22 @@ func (m *Manager) SaveUpstreamServer(serverConfig *config.ServerConfig) error {
 	defer m.mu.Unlock()
 
 	record := &UpstreamRecord{
-		ID:          serverConfig.Name, // Use name as ID for simplicity
-		Name:        serverConfig.Name,
-		URL:         serverConfig.URL,
-		Protocol:    serverConfig.Protocol,
-		Command:     serverConfig.Command,
-		Args:        serverConfig.Args,
-		WorkingDir:  serverConfig.WorkingDir,
-		Env:         serverConfig.Env,
-		Headers:     serverConfig.Headers,
-		OAuth:       serverConfig.OAuth,
-		Enabled:     serverConfig.Enabled,
-		Quarantined: serverConfig.Quarantined,
-		Created:     serverConfig.Created,
-		Updated:     time.Now(),
-		Isolation:   serverConfig.Isolation,
+		ID:             serverConfig.Name, // Use name as ID for simplicity
+		Name:           serverConfig.Name,
+		URL:            serverConfig.URL,
+		Protocol:       serverConfig.Protocol,
+		Command:        serverConfig.Command,
+		Args:           serverConfig.Args,
+		WorkingDir:     serverConfig.WorkingDir,
+		Env:            serverConfig.Env,
+		Headers:        serverConfig.Headers,
+		OAuth:          serverConfig.OAuth,
+		Enabled:        serverConfig.Enabled,
+		Quarantined:    serverConfig.Quarantined,
+		Created:        serverConfig.Created,
+		Updated:        time.Now(),
+		Isolation:      serverConfig.Isolation,
+		ReconnectOnUse: serverConfig.ReconnectOnUse,
 	}
 
 	return m.db.SaveUpstream(record)
@@ -115,20 +117,21 @@ func (m *Manager) GetUpstreamServer(name string) (*config.ServerConfig, error) {
 	}
 
 	return &config.ServerConfig{
-		Name:        record.Name,
-		URL:         record.URL,
-		Protocol:    record.Protocol,
-		Command:     record.Command,
-		Args:        record.Args,
-		WorkingDir:  record.WorkingDir,
-		Env:         record.Env,
-		Headers:     record.Headers,
-		OAuth:       record.OAuth,
-		Enabled:     record.Enabled,
-		Quarantined: record.Quarantined,
-		Created:     record.Created,
-		Updated:     record.Updated,
-		Isolation:   record.Isolation,
+		Name:           record.Name,
+		URL:            record.URL,
+		Protocol:       record.Protocol,
+		Command:        record.Command,
+		Args:           record.Args,
+		WorkingDir:     record.WorkingDir,
+		Env:            record.Env,
+		Headers:        record.Headers,
+		OAuth:          record.OAuth,
+		Enabled:        record.Enabled,
+		Quarantined:    record.Quarantined,
+		Created:        record.Created,
+		Updated:        record.Updated,
+		Isolation:      record.Isolation,
+		ReconnectOnUse: record.ReconnectOnUse,
 	}, nil
 }
 
@@ -145,20 +148,21 @@ func (m *Manager) ListUpstreamServers() ([]*config.ServerConfig, error) {
 	var servers []*config.ServerConfig
 	for _, record := range records {
 		servers = append(servers, &config.ServerConfig{
-			Name:        record.Name,
-			URL:         record.URL,
-			Protocol:    record.Protocol,
-			Command:     record.Command,
-			Args:        record.Args,
-			WorkingDir:  record.WorkingDir,
-			Env:         record.Env,
-			Headers:     record.Headers,
-			OAuth:       record.OAuth,
-			Enabled:     record.Enabled,
-			Quarantined: record.Quarantined,
-			Created:     record.Created,
-			Updated:     record.Updated,
-			Isolation:   record.Isolation,
+			Name:           record.Name,
+			URL:            record.URL,
+			Protocol:       record.Protocol,
+			Command:        record.Command,
+			Args:           record.Args,
+			WorkingDir:     record.WorkingDir,
+			Env:            record.Env,
+			Headers:        record.Headers,
+			OAuth:          record.OAuth,
+			Enabled:        record.Enabled,
+			Quarantined:    record.Quarantined,
+			Created:        record.Created,
+			Updated:        record.Updated,
+			Isolation:      record.Isolation,
+			ReconnectOnUse: record.ReconnectOnUse,
 		})
 	}
 
@@ -424,6 +428,168 @@ func (m *Manager) DeleteServerToolApprovals(serverName string) error {
 	defer m.mu.Unlock()
 
 	return m.db.DeleteServerToolApprovals(serverName)
+}
+
+// Security Scanner methods (Spec 039)
+
+// SaveScanner saves a scanner plugin record
+func (m *Manager) SaveScanner(s *scanner.ScannerPlugin) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.SaveScanner(s)
+}
+
+// GetScanner retrieves a scanner plugin by ID
+func (m *Manager) GetScanner(id string) (*scanner.ScannerPlugin, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.GetScanner(id)
+}
+
+// ListScanners returns all scanner plugin records
+func (m *Manager) ListScanners() ([]*scanner.ScannerPlugin, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.ListScanners()
+}
+
+// DeleteScanner deletes a scanner plugin by ID
+func (m *Manager) DeleteScanner(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.DeleteScanner(id)
+}
+
+// SaveScanJob saves a scan job record
+func (m *Manager) SaveScanJob(job *scanner.ScanJob) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.SaveScanJob(job)
+}
+
+// GetScanJob retrieves a scan job by ID
+func (m *Manager) GetScanJob(id string) (*scanner.ScanJob, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.GetScanJob(id)
+}
+
+// ListScanJobs returns scan jobs, optionally filtered by server name
+func (m *Manager) ListScanJobs(serverName string) ([]*scanner.ScanJob, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.ListScanJobs(serverName)
+}
+
+// GetLatestScanJob returns the most recent scan job for a server
+func (m *Manager) GetLatestScanJob(serverName string) (*scanner.ScanJob, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.GetLatestScanJob(serverName)
+}
+
+// DeleteScanJob deletes a scan job by ID
+func (m *Manager) DeleteScanJob(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.DeleteScanJob(id)
+}
+
+// DeleteServerScanJobs deletes all scan jobs for a server
+func (m *Manager) DeleteServerScanJobs(serverName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.DeleteServerScanJobs(serverName)
+}
+
+// SaveScanReport saves a scan report record
+func (m *Manager) SaveScanReport(report *scanner.ScanReport) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.SaveScanReport(report)
+}
+
+// GetScanReport retrieves a scan report by ID
+func (m *Manager) GetScanReport(id string) (*scanner.ScanReport, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.GetScanReport(id)
+}
+
+// ListScanReports returns scan reports, optionally filtered by server name
+func (m *Manager) ListScanReports(serverName string) ([]*scanner.ScanReport, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.ListScanReports(serverName)
+}
+
+// ListScanReportsByJob returns all scan reports for a specific scan job
+func (m *Manager) ListScanReportsByJob(jobID string) ([]*scanner.ScanReport, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.ListScanReportsByJob(jobID)
+}
+
+// DeleteScanReport deletes a scan report by ID
+func (m *Manager) DeleteScanReport(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.DeleteScanReport(id)
+}
+
+// DeleteServerScanReports deletes all scan reports for a server
+func (m *Manager) DeleteServerScanReports(serverName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.DeleteServerScanReports(serverName)
+}
+
+// SaveIntegrityBaseline saves an integrity baseline record
+func (m *Manager) SaveIntegrityBaseline(baseline *scanner.IntegrityBaseline) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.SaveIntegrityBaseline(baseline)
+}
+
+// GetIntegrityBaseline retrieves an integrity baseline by server name
+func (m *Manager) GetIntegrityBaseline(serverName string) (*scanner.IntegrityBaseline, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.GetIntegrityBaseline(serverName)
+}
+
+// DeleteIntegrityBaseline deletes an integrity baseline by server name
+func (m *Manager) DeleteIntegrityBaseline(serverName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.DeleteIntegrityBaseline(serverName)
+}
+
+// ListIntegrityBaselines returns all integrity baseline records
+func (m *Manager) ListIntegrityBaselines() ([]*scanner.IntegrityBaseline, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.db.ListIntegrityBaselines()
 }
 
 // Docker recovery state operations
@@ -962,8 +1128,8 @@ func (m *Manager) CreateSession(session *SessionRecord) error {
 		c := bucket.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			keyStr := string(k)
-			// Check if key ends with the session ID (after the underscore)
-			if len(keyStr) > len(session.ID) && keyStr[len(keyStr)-len(session.ID):] == session.ID {
+			// Check if key ends with _{session_id}
+			if strings.HasSuffix(keyStr, "_"+session.ID) {
 				existingKey = k
 				if err := json.Unmarshal(v, &existingSession); err != nil {
 					m.logger.Warnw("Failed to unmarshal existing session", "error", err)
@@ -1033,8 +1199,8 @@ func (m *Manager) CloseSession(sessionID string) error {
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			// Key format: {timestamp_ns}_{session_id}
 			keyStr := string(k)
-			// Check if key ends with the session ID (after the underscore)
-			if len(keyStr) > len(sessionID) && keyStr[len(keyStr)-len(sessionID):] == sessionID {
+			// Check if key ends with _{session_id}
+			if strings.HasSuffix(keyStr, "_"+sessionID) {
 				sessionKey = k
 				if err := json.Unmarshal(v, &session); err != nil {
 					return fmt.Errorf("failed to unmarshal session: %w", err)
@@ -1115,8 +1281,8 @@ func (m *Manager) GetSessionByID(sessionID string) (*SessionRecord, error) {
 		c := bucket.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			keyStr := string(k)
-			// Check if key ends with the session ID (after the underscore)
-			if len(keyStr) > len(sessionID) && keyStr[len(keyStr)-len(sessionID):] == sessionID {
+			// Check if key ends with _{session_id}
+			if strings.HasSuffix(keyStr, "_"+sessionID) {
 				var s SessionRecord
 				if err := json.Unmarshal(v, &s); err != nil {
 					return fmt.Errorf("failed to unmarshal session: %w", err)
@@ -1200,8 +1366,8 @@ func (m *Manager) UpdateSessionStats(sessionID string, tokens int) error {
 		c := bucket.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			keyStr := string(k)
-			// Check if key ends with the session ID (after the underscore)
-			if len(keyStr) > len(sessionID) && keyStr[len(keyStr)-len(sessionID):] == sessionID {
+			// Check if key ends with _{session_id}
+			if strings.HasSuffix(keyStr, "_"+sessionID) {
 				sessionKey = k
 				if err := json.Unmarshal(v, &session); err != nil {
 					return fmt.Errorf("failed to unmarshal session: %w", err)
@@ -1225,6 +1391,38 @@ func (m *Manager) UpdateSessionStats(sessionID string, tokens int) error {
 		}
 
 		return bucket.Put(sessionKey, data)
+	})
+}
+
+// UpdateSessionActivity updates LastActivity without incrementing tool call counts.
+// Call this on any MCP message to keep the session alive.
+func (m *Manager) UpdateSessionActivity(sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.db.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(SessionsBucket))
+		if bucket == nil {
+			return nil
+		}
+
+		c := bucket.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			keyStr := string(k)
+			if strings.HasSuffix(keyStr, "_"+sessionID) {
+				var session SessionRecord
+				if err := json.Unmarshal(v, &session); err != nil {
+					return err
+				}
+				session.LastActivity = time.Now()
+				data, err := json.Marshal(session)
+				if err != nil {
+					return err
+				}
+				return bucket.Put(k, data)
+			}
+		}
+		return nil // Session not found is not an error - may not be persisted yet
 	})
 }
 

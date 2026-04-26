@@ -380,6 +380,20 @@ func (mc *Client) ShouldRetry() bool {
 	return mc.StateManager.ShouldRetry()
 }
 
+// IsDockerIsolated returns true if this server will use Docker isolation.
+// Used to select appropriate connect timeouts (Docker containers need more time for package installation).
+func (mc *Client) IsDockerIsolated() bool {
+	if mc.globalConfig == nil || mc.globalConfig.DockerIsolation == nil || !mc.globalConfig.DockerIsolation.Enabled {
+		return false
+	}
+	// Check if server has isolation explicitly disabled
+	if mc.Config.Isolation != nil && mc.Config.Isolation.Enabled != nil && !*mc.Config.Isolation.Enabled {
+		return false
+	}
+	// Only stdio servers with commands get Docker-isolated
+	return mc.Config.Command != ""
+}
+
 // SetUserLoggedOut marks that the user has explicitly logged out
 // This prevents automatic reconnection until cleared (e.g., by explicit login)
 func (mc *Client) SetUserLoggedOut(loggedOut bool) {
@@ -695,13 +709,25 @@ func (mc *Client) performHealthCheck() {
 	}
 
 	// Check if client is in error state and should retry connection (non-OAuth errors)
-	if mc.StateManager.GetState() == types.StateError && mc.ShouldRetry() {
-		mc.logger.Info("Attempting automatic reconnection with exponential backoff",
-			zap.String("server", mc.Config.Name),
-			zap.Int("retry_count", mc.StateManager.GetConnectionInfo().RetryCount))
+	if mc.StateManager.GetState() == types.StateError {
+		info := mc.StateManager.GetConnectionInfo()
+		if info.GaveUp {
+			// Log once at WARN then suppress — server needs manual reconnect
+			if info.RetryCount == types.MaxConnectionRetries {
+				mc.logger.Warn("Giving up automatic reconnection after max retries — use manual reconnect or reconnect-on-use",
+					zap.String("server", mc.Config.Name),
+					zap.Int("retry_count", info.RetryCount))
+			}
+			return
+		}
+		if mc.ShouldRetry() {
+			mc.logger.Info("Attempting automatic reconnection with exponential backoff",
+				zap.String("server", mc.Config.Name),
+				zap.Int("retry_count", info.RetryCount))
 
-		mc.tryReconnect()
-		return
+			mc.tryReconnect()
+			return
+		}
 	}
 
 	// Skip health checks if not connected
@@ -798,6 +824,8 @@ func (mc *Client) ForceReconnect(reason string) {
 		zap.String("reason", reason),
 		zap.String("state", mc.StateManager.GetState().String()))
 
+	// Full Reset clears retryCount so a "gave up" server can be retried
+	mc.StateManager.Reset()
 	go mc.tryReconnect()
 }
 
@@ -845,8 +873,8 @@ func (mc *Client) tryReconnect() {
 			zap.Error(err))
 	}
 
-	// Reset state to disconnected before attempting reconnection
-	mc.StateManager.Reset()
+	// Transition to disconnected for reconnect, preserving retryCount for backoff
+	mc.StateManager.ResetForReconnect()
 
 	// Attempt to reconnect using the existing Connect method
 	// The Connect method already handles state transitions and error management
@@ -879,6 +907,115 @@ func (mc *Client) tryReconnect() {
 	mc.logger.Info("Reconnection attempt successful",
 		zap.String("server", mc.Config.Name),
 		zap.String("new_state", mc.StateManager.GetState().String()))
+}
+
+// TryReconnectSync attempts a synchronous reconnection within the given context.
+// Unlike ForceReconnect which spawns a goroutine, this blocks until the reconnect
+// attempt completes or the context is cancelled. It uses the existing reconnectInProgress
+// flag to prevent concurrent reconnection storms.
+//
+// Returns nil if reconnection succeeds, error otherwise.
+func (mc *Client) TryReconnectSync(ctx context.Context) error {
+	if mc == nil {
+		return fmt.Errorf("client is nil")
+	}
+
+	// Check context before starting
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("context already cancelled: %w", err)
+	}
+
+	// Skip if user explicitly logged out
+	if mc.IsUserLoggedOut() {
+		return fmt.Errorf("reconnect skipped: user explicitly logged out")
+	}
+
+	// Skip if already connected
+	if mc.IsConnected() {
+		return nil
+	}
+
+	// Skip if currently connecting (another attempt is in progress)
+	if mc.IsConnecting() {
+		return fmt.Errorf("reconnect skipped: connection already in progress")
+	}
+
+	// Acquire reconnect lock to prevent storms
+	mc.reconnectMu.Lock()
+	if mc.reconnectInProgress {
+		mc.reconnectMu.Unlock()
+		// Another reconnect is in progress — wait for it to finish by polling
+		// with the context deadline rather than starting a duplicate attempt
+		return mc.waitForReconnectCompletion(ctx)
+	}
+	mc.reconnectInProgress = true
+	mc.reconnectMu.Unlock()
+
+	// Clear reconnect flag when done
+	defer func() {
+		mc.reconnectMu.Lock()
+		mc.reconnectInProgress = false
+		mc.reconnectMu.Unlock()
+	}()
+
+	serverName := ""
+	if mc.Config != nil {
+		serverName = mc.Config.Name
+	}
+
+	mc.logger.Info("TryReconnectSync: starting synchronous reconnect",
+		zap.String("server", serverName))
+
+	// Disconnect stale state first
+	mc.cancelInFlightConnect()
+	mc.cancelInFlightListTools()
+	if err := mc.coreClient.Disconnect(); err != nil {
+		mc.logger.Warn("TryReconnectSync: disconnect during reconnect returned error",
+			zap.String("server", serverName),
+			zap.Error(err))
+	}
+
+	// Reset state to disconnected
+	mc.StateManager.Reset()
+
+	// Attempt synchronous connect with the provided context
+	if err := mc.Connect(ctx); err != nil {
+		mc.logger.Warn("TryReconnectSync: reconnect failed",
+			zap.String("server", serverName),
+			zap.Error(err))
+		return fmt.Errorf("reconnect failed: %w", err)
+	}
+
+	mc.logger.Info("TryReconnectSync: reconnect succeeded",
+		zap.String("server", serverName),
+		zap.String("new_state", mc.StateManager.GetState().String()))
+
+	return nil
+}
+
+// waitForReconnectCompletion polls until an in-progress reconnect completes or the context expires.
+func (mc *Client) waitForReconnectCompletion(ctx context.Context) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for in-progress reconnect: %w", ctx.Err())
+		case <-ticker.C:
+			mc.reconnectMu.Lock()
+			inProgress := mc.reconnectInProgress
+			mc.reconnectMu.Unlock()
+
+			if !inProgress {
+				// Reconnect finished — check if it succeeded
+				if mc.IsConnected() {
+					return nil
+				}
+				return fmt.Errorf("concurrent reconnect completed but connection not established")
+			}
+		}
+	}
 }
 
 // isConnectionError checks if an error indicates a connection problem

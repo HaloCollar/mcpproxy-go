@@ -164,40 +164,85 @@ func (p *MCPProxyServer) makeDirectModeHandler(serverName, toolName string, anno
 
 		durationMs := time.Since(startTime).Milliseconds()
 
+		// Spec 035: Determine content trust based on openWorldHint
+		directContentTrust := contracts.ContentTrustForTool(annotations)
+
 		if err != nil {
 			// Emit error activity
-			p.emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, "mcp", "error", err.Error(), durationMs, enrichedArgs, "", false, "", nil)
+			p.emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, "mcp", "error", err.Error(), durationMs, enrichedArgs, "", false, "", nil, directContentTrust)
 			return mcp.NewToolResultError(fmt.Sprintf("Error calling %s:%s: %v", serverName, toolName, err)), nil
-		}
-
-		// Format response
-		var responseText string
-		switch v := result.(type) {
-		case string:
-			responseText = v
-		default:
-			responseBytes, marshalErr := json.Marshal(v)
-			if marshalErr != nil {
-				responseText = fmt.Sprintf("%v", v)
-			} else {
-				responseText = string(responseBytes)
-			}
 		}
 
 		// Determine tool variant for activity logging
 		toolVariant := contracts.DeriveCallWith(annotations)
 
-		// Truncate if needed
-		truncated := false
-		if p.config.ToolResponseLimit > 0 && len(responseText) > p.config.ToolResponseLimit {
-			responseText = responseText[:p.config.ToolResponseLimit]
-			truncated = true
+		// Forward content blocks (preserving ImageContent, AudioContent, etc.)
+		// while applying truncation only to TextContent. See issue #368.
+		//
+		// Direct mode has a simpler truncator based on ToolResponseLimit; the
+		// Truncator type (with caching) is not available here.
+		var forwarded *mcp.CallToolResult
+		var responseText string
+		var truncated bool
+		if ctr, ok := result.(*mcp.CallToolResult); ok && ctr != nil {
+			newContent := make([]mcp.Content, 0, len(ctr.Content))
+			var parts []string
+			limit := p.config.ToolResponseLimit
+			for _, c := range ctr.Content {
+				switch tc := c.(type) {
+				case mcp.TextContent:
+					txt := tc.Text
+					if limit > 0 && len(txt) > limit {
+						txt = txt[:limit]
+						truncated = true
+					}
+					tc.Text = txt
+					newContent = append(newContent, tc)
+					parts = append(parts, txt)
+				case mcp.ImageContent:
+					newContent = append(newContent, tc)
+					parts = append(parts, fmt.Sprintf("[image:%s len=%d]", tc.MIMEType, len(tc.Data)))
+				case mcp.AudioContent:
+					newContent = append(newContent, tc)
+					parts = append(parts, fmt.Sprintf("[audio:%s len=%d]", tc.MIMEType, len(tc.Data)))
+				default:
+					newContent = append(newContent, c)
+					if b, err := json.Marshal(c); err == nil {
+						parts = append(parts, string(b))
+					}
+				}
+			}
+			forwarded = &mcp.CallToolResult{
+				Result:            ctr.Result,
+				Content:           newContent,
+				StructuredContent: ctr.StructuredContent,
+				IsError:           ctr.IsError,
+			}
+			responseText = joinTextParts(parts)
+		} else {
+			// Fallback for non-CallToolResult values (string, struct, etc.)
+			switch v := result.(type) {
+			case string:
+				responseText = v
+			default:
+				responseBytes, marshalErr := json.Marshal(v)
+				if marshalErr != nil {
+					responseText = fmt.Sprintf("%v", v)
+				} else {
+					responseText = string(responseBytes)
+				}
+			}
+			if p.config.ToolResponseLimit > 0 && len(responseText) > p.config.ToolResponseLimit {
+				responseText = responseText[:p.config.ToolResponseLimit]
+				truncated = true
+			}
+			forwarded = mcp.NewToolResultText(responseText)
 		}
 
 		// Emit success activity
-		p.emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, "mcp", "success", "", durationMs, enrichedArgs, responseText, truncated, toolVariant, nil)
+		p.emitActivityToolCallCompleted(serverName, toolName, sessionID, requestID, "mcp", "success", "", durationMs, enrichedArgs, responseText, truncated, toolVariant, nil, directContentTrust)
 
-		return mcp.NewToolResultText(responseText), nil
+		return forwarded, nil
 	}
 }
 
@@ -215,15 +260,30 @@ func (p *MCPProxyServer) buildCodeExecModeTools() []mcpserver.ServerTool {
 		mcp.WithDescription("Search and discover available upstream tools using BM25 full-text search. "+
 			"Use this to find tools, then use the `code_execution` tool to call them via `call_tool(serverName, toolName, args)` in JavaScript. "+
 			"Do NOT use call_tool_read/write/destructive — they are not available in this mode. "+
-			"Use natural language to describe what you want to accomplish."),
+			"Use natural language to describe what you want to accomplish. "+
+			"Response includes a structured `session_risk` object (level, lethal_trifecta, has_open_world_tools, has_destructive_tools, has_write_tools)."),
 		mcp.WithTitleAnnotation("Retrieve Tools"),
 		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Natural language description of what you want to accomplish."),
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("Maximum number of tools to return (default: configured tools_limit, max: 100)"),
+		),
+		mcp.WithBoolean("read_only_only",
+			mcp.Description("Only return tools with readOnlyHint=true. Use to self-restrict to safe read operations."),
+		),
+		mcp.WithBoolean("exclude_destructive",
+			mcp.Description("Exclude tools with destructiveHint=true or unset (MCP default is destructive). Use to avoid destructive operations."),
+		),
+		mcp.WithBoolean("exclude_open_world",
+			mcp.Description("Exclude tools with openWorldHint=true or unset (MCP default is open-world). Use to restrict to local/sandboxed tools."),
+		),
+		mcp.WithBoolean("include_session_risk_warning",
+			mcp.Description("Include the prose 'warning' string in session_risk when the lethal trifecta is detected (default: false; structured fields are always returned). Server-side default can be flipped via the 'tool_response_session_risk_warning' config flag."),
 		),
 	)
 	tools = append(tools, mcpserver.ServerTool{
@@ -250,10 +310,14 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 		mcp.WithDescription("Search and discover available upstream tools using BM25 full-text search. "+
 			"WORKFLOW: 1) Call this tool first to find relevant tools, 2) Check the 'call_with' field in results "+
 			"to determine which variant to use, 3) Call the tool using call_tool_read, call_tool_write, or call_tool_destructive. "+
-			"Results include 'annotations' (tool behavior hints like destructiveHint) and 'call_with' recommendation. "+
+			"Results include 'annotations' (tool behavior hints like destructiveHint), 'call_with' recommendation, "+
+			"and a structured `session_risk` object (level, lethal_trifecta, has_open_world_tools, has_destructive_tools, has_write_tools). "+
+			"Use annotation filters to self-restrict discovery scope. "+
 			"Use natural language to describe what you want to accomplish."),
 		mcp.WithTitleAnnotation("Retrieve Tools"),
 		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Natural language description of what you want to accomplish. Be specific (e.g., 'create a new GitHub repository', 'get weather for London')."),
@@ -270,81 +334,37 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 		mcp.WithString("explain_tool",
 			mcp.Description("When debug=true, explain why a specific tool was ranked low (format: 'server:tool')"),
 		),
+		mcp.WithBoolean("read_only_only",
+			mcp.Description("Only return tools with readOnlyHint=true. Use to self-restrict to safe read operations."),
+		),
+		mcp.WithBoolean("exclude_destructive",
+			mcp.Description("Exclude tools with destructiveHint=true or unset (MCP default is destructive). Use to avoid destructive operations."),
+		),
+		mcp.WithBoolean("exclude_open_world",
+			mcp.Description("Exclude tools with openWorldHint=true or unset (MCP default is open-world). Use to restrict to local/sandboxed tools."),
+		),
+		mcp.WithBoolean("include_session_risk_warning",
+			mcp.Description("Include the prose 'warning' string in session_risk when the lethal trifecta is detected (default: false; structured fields are always returned). Server-side default can be flipped via the 'tool_response_session_risk_warning' config flag."),
+		),
 	)
 	tools = append(tools, mcpserver.ServerTool{
 		Tool:    retrieveToolsTool,
 		Handler: p.handleRetrieveToolsForMode(config.RoutingModeRetrieveTools),
 	})
 
-	// call_tool_read
-	callToolReadTool := mcp.NewTool(contracts.ToolVariantRead,
-		mcp.WithDescription("Execute a READ-ONLY tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. Use this for: search, query, list, get, fetch, find, check, view, read, show, describe, lookup, retrieve, browse, explore, discover, scan, inspect, analyze, examine, validate, verify. This is the DEFAULT choice when unsure."),
-		mcp.WithTitleAnnotation("Call Tool (Read)"),
-		mcp.WithReadOnlyHintAnnotation(true),
-		mcp.WithString("name",
-			mcp.Required(),
-			mcp.Description("Tool name in format 'server:tool' (e.g., 'github:get_user'). Use exact names from retrieve_tools results."),
-		),
-		mcp.WithString("args_json",
-			mcp.Description("Arguments as JSON string. Refer to the tool's inputSchema from retrieve_tools."),
-		),
-		mcp.WithString("intent_data_sensitivity",
-			mcp.Description("Classify data: public, internal, private, or unknown."),
-		),
-		mcp.WithString("intent_reason",
-			mcp.Description("Why is this tool being called? Provide context."),
-		),
-	)
+	// call_tool_read / call_tool_write / call_tool_destructive — all three
+	// built from the shared helper in mcp.go so schema stays in sync across
+	// the default and retrieve_tools routing modes.
 	tools = append(tools, mcpserver.ServerTool{
-		Tool:    callToolReadTool,
+		Tool:    buildCallToolVariantTool(contracts.ToolVariantRead),
 		Handler: p.handleCallToolRead,
 	})
-
-	// call_tool_write
-	callToolWriteTool := mcp.NewTool(contracts.ToolVariantWrite,
-		mcp.WithDescription("Execute a STATE-MODIFYING tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. Use this for: create, update, modify, add, set, send, edit, change, write, post, put, patch, insert, upload, submit. Use only when explicitly modifying state."),
-		mcp.WithTitleAnnotation("Call Tool (Write)"),
-		mcp.WithDestructiveHintAnnotation(false),
-		mcp.WithString("name",
-			mcp.Required(),
-			mcp.Description("Tool name in format 'server:tool' (e.g., 'github:create_issue'). Use exact names from retrieve_tools results."),
-		),
-		mcp.WithString("args_json",
-			mcp.Description("Arguments as JSON string. Refer to the tool's inputSchema from retrieve_tools."),
-		),
-		mcp.WithString("intent_data_sensitivity",
-			mcp.Description("Classify data: public, internal, private, or unknown."),
-		),
-		mcp.WithString("intent_reason",
-			mcp.Description("Why is this modification needed? Provide context."),
-		),
-	)
 	tools = append(tools, mcpserver.ServerTool{
-		Tool:    callToolWriteTool,
+		Tool:    buildCallToolVariantTool(contracts.ToolVariantWrite),
 		Handler: p.handleCallToolWrite,
 	})
-
-	// call_tool_destructive
-	callToolDestructiveTool := mcp.NewTool(contracts.ToolVariantDestructive,
-		mcp.WithDescription("Execute a DESTRUCTIVE tool. WORKFLOW: 1) Call retrieve_tools first to find tools, 2) Use the exact 'name' field from results. Use this for: delete, remove, drop, revoke, disable, destroy, purge, reset, clear, terminate. Use for irreversible or high-impact operations."),
-		mcp.WithTitleAnnotation("Call Tool (Destructive)"),
-		mcp.WithDestructiveHintAnnotation(true),
-		mcp.WithString("name",
-			mcp.Required(),
-			mcp.Description("Tool name in format 'server:tool' (e.g., 'github:delete_repo'). Use exact names from retrieve_tools results."),
-		),
-		mcp.WithString("args_json",
-			mcp.Description("Arguments as JSON string. Refer to the tool's inputSchema from retrieve_tools."),
-		),
-		mcp.WithString("intent_data_sensitivity",
-			mcp.Description("Classify data: public, internal, private, or unknown."),
-		),
-		mcp.WithString("intent_reason",
-			mcp.Description("Why is this deletion needed? Provide justification."),
-		),
-	)
 	tools = append(tools, mcpserver.ServerTool{
-		Tool:    callToolDestructiveTool,
+		Tool:    buildCallToolVariantTool(contracts.ToolVariantDestructive),
 		Handler: p.handleCallToolDestructive,
 	})
 
@@ -353,6 +373,8 @@ func (p *MCPProxyServer) buildCallToolModeTools() []mcpserver.ServerTool {
 		mcp.WithDescription("Retrieve paginated data when mcpproxy indicates a tool response was truncated. Use the cache key provided in truncation messages."),
 		mcp.WithTitleAnnotation("Read Cache"),
 		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(false),
 		mcp.WithString("key",
 			mcp.Required(),
 			mcp.Description("Cache key provided by mcpproxy when a response was truncated."),
@@ -390,6 +412,8 @@ func (p *MCPProxyServer) buildCodeExecutionTool() []mcpserver.ServerTool {
 			mcp.WithDescription("Code execution is currently disabled. Enable it by setting \"enable_code_execution\": true in your mcpproxy config."),
 			mcp.WithTitleAnnotation("Code Execution (Disabled)"),
 			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
 			mcp.WithString("code",
 				mcp.Required(),
 				mcp.Description("JavaScript source code to execute."),
@@ -424,6 +448,8 @@ func (p *MCPProxyServer) buildCodeExecutionTool() []mcpserver.ServerTool {
 			"**Security**: Sandboxed execution with timeout enforcement. Respects existing quarantine and server restrictions."),
 		mcp.WithTitleAnnotation("Code Execution"),
 		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(true),
 		mcp.WithString("code",
 			mcp.Required(),
 			mcp.Description("JavaScript or TypeScript source code (ES2020+) to execute. Supports modern syntax: arrow functions, const/let, template literals, destructuring, "+
@@ -453,28 +479,34 @@ func (p *MCPProxyServer) buildCodeExecutionTool() []mcpserver.ServerTool {
 // Each server instance has its own set of tools registered appropriate for that mode.
 // The main "server" field remains the retrieve_tools mode server (default).
 func (p *MCPProxyServer) initRoutingModeServers() {
+	// All routing mode servers share the same hooks for session tracking
+	opts := []mcpserver.ServerOption{
+		mcpserver.WithToolCapabilities(true),
+		mcpserver.WithRecovery(),
+	}
+	if p.hooks != nil {
+		opts = append(opts, mcpserver.WithHooks(p.hooks))
+	}
+
 	// Create direct mode server
 	p.directServer = mcpserver.NewMCPServer(
 		"mcpproxy-go",
 		mcpServerVersion(),
-		mcpserver.WithToolCapabilities(true),
-		mcpserver.WithRecovery(),
+		opts...,
 	)
 
 	// Create code execution mode server
 	p.codeExecServer = mcpserver.NewMCPServer(
 		"mcpproxy-go",
 		mcpServerVersion(),
-		mcpserver.WithToolCapabilities(true),
-		mcpserver.WithRecovery(),
+		opts...,
 	)
 
 	// Create call tool mode server (/mcp/call)
 	p.callToolServer = mcpserver.NewMCPServer(
 		"mcpproxy-go",
 		mcpServerVersion(),
-		mcpserver.WithToolCapabilities(true),
-		mcpserver.WithRecovery(),
+		opts...,
 	)
 
 	// Register tools for code execution mode (static tools that don't change)

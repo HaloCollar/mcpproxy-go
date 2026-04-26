@@ -3,6 +3,12 @@ import Dashboard from '@/views/Dashboard.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
+  scrollBehavior() {
+    // Scroll main content area to top on every navigation
+    const main = document.querySelector('main.overflow-y-auto')
+    if (main) main.scrollTop = 0
+    return { top: 0 }
+  },
   routes: [
     // Server edition auth routes
     {
@@ -62,6 +68,14 @@ const router = createRouter({
       },
     },
     {
+      path: '/feedback',
+      name: 'feedback',
+      component: () => import('@/views/Feedback.vue'),
+      meta: {
+        title: 'Send Feedback',
+      },
+    },
+    {
       path: '/secrets',
       name: 'secrets',
       component: () => import('@/views/Secrets.vue'),
@@ -83,6 +97,23 @@ const router = createRouter({
       component: () => import('@/views/Activity.vue'),
       meta: {
         title: 'Activity Log',
+      },
+    },
+    {
+      path: '/security',
+      name: 'security',
+      component: () => import('@/views/Security.vue'),
+      meta: {
+        title: 'Security',
+      },
+    },
+    {
+      path: '/security/scans/:jobId',
+      name: 'scan-report',
+      component: () => import('@/views/ScanReport.vue'),
+      props: true,
+      meta: {
+        title: 'Scan Report',
       },
     },
     {

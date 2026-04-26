@@ -99,7 +99,7 @@ coverage.txt
 
 # Cache directories
 .cache/
-*.cache 
+*.cache
 data/
 .cursor/
 assets/mcpproxy.icns
@@ -135,3 +135,7 @@ website/npm-debug.log*
 website/yarn-error.log*
 __pycache__/
 web/frontend/dist/index.html
+native/macos/MCPProxy/.build/
+
+# Wrangler session cache
+.wrangler/

@@ -1,6 +1,7 @@
 package contracts
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -41,15 +42,18 @@ func ConvertServerConfig(cfg *config.ServerConfig, status string, connected bool
 		}
 	}
 
-	// Convert isolation config if present
+	// Convert isolation config if present. The per-server overrides that
+	// actually live on config.IsolationConfig are Image/NetworkMode/
+	// ExtraArgs/WorkingDir; MemoryLimit/CPULimit/Timeout are still only
+	// available at the global DockerIsolationConfig level, so they stay
+	// empty here until that refactor lands.
 	if cfg.Isolation != nil {
 		server.Isolation = &IsolationConfig{
-			Enabled:     cfg.Isolation.IsEnabled(), // Dereference *bool safely
+			Enabled:     cfg.Isolation.IsEnabled(),
 			Image:       cfg.Isolation.Image,
-			MemoryLimit: "", // TODO: Move from DockerIsolationConfig
-			CPULimit:    "", // TODO: Move from DockerIsolationConfig
+			NetworkMode: cfg.Isolation.NetworkMode,
+			ExtraArgs:   append([]string(nil), cfg.Isolation.ExtraArgs...),
 			WorkingDir:  cfg.Isolation.WorkingDir,
-			Timeout:     "", // TODO: Move from DockerIsolationConfig
 		}
 	}
 
@@ -302,6 +306,22 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 			server.LastReconnectAt = &lastReconnectAt
 		}
 
+		// Spec 044 — carry structured diagnostic + stable error code through
+		// the legacy fallback path. The management service does the same for
+		// the happy path; this ensures the REST envelope never drops them.
+		if errCode, ok := generic["error_code"].(string); ok && errCode != "" {
+			server.ErrorCode = errCode
+		}
+		if diagRaw, ok := generic["diagnostic"].(map[string]interface{}); ok && diagRaw != nil {
+			d := &Diagnostic{}
+			// JSON round-trip handles both named-string types (diagnostics.Code,
+			// diagnostics.Severity) and plain strings (after a JSON decode).
+			if raw, err := json.Marshal(diagRaw); err == nil {
+				_ = json.Unmarshal(raw, d)
+			}
+			server.Diagnostic = d
+		}
+
 		servers = append(servers, server)
 	}
 
@@ -341,9 +361,17 @@ func ConvertGenericToolsToTyped(genericTools []map[string]interface{}) []Tool {
 			tool.LastUsed = &lastUsed
 		}
 
-		// Extract annotations
+		// Extract annotations — may be a struct pointer or a map depending on source
 		if annotations, ok := generic["annotations"].(map[string]interface{}); ok {
 			tool.Annotations = convertMapToToolAnnotation(annotations)
+		} else if annotationsPtr, ok := generic["annotations"].(*config.ToolAnnotations); ok && annotationsPtr != nil {
+			tool.Annotations = &ToolAnnotation{
+				Title:           annotationsPtr.Title,
+				ReadOnlyHint:    annotationsPtr.ReadOnlyHint,
+				DestructiveHint: annotationsPtr.DestructiveHint,
+				IdempotentHint:  annotationsPtr.IdempotentHint,
+				OpenWorldHint:   annotationsPtr.OpenWorldHint,
+			}
 		}
 
 		tools = append(tools, tool)

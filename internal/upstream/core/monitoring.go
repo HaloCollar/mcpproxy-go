@@ -5,11 +5,21 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
 	"go.uber.org/zap"
+)
+
+const (
+	// maxRecentStderrLines bounds the per-client ring buffer of recent
+	// stderr output. Kept small because this is meant for the last few
+	// lines before a failure — not a log archive.
+	maxRecentStderrLines = 20
+	// maxStderrLineLen truncates individual lines stored in the ring
+	// buffer to protect memory against a misbehaving child that spews
+	// huge single lines (e.g. a base64-encoded traceback).
+	maxStderrLineLen = 512
 )
 
 // StartStderrMonitoring starts monitoring stderr output and logging it
@@ -152,6 +162,8 @@ func (c *Client) monitorStderr() {
 			if c.upstreamLogger != nil {
 				c.upstreamLogger.Info("stderr", zap.String("message", line))
 			}
+
+			c.recordRecentStderr(line)
 		}
 	}
 
@@ -245,6 +257,52 @@ waitLoop:
 		zap.String("container_id", shortContainerID(containerID)))
 }
 
+// recordRecentStderr appends a stderr line to the bounded ring buffer.
+func (c *Client) recordRecentStderr(line string) {
+	if line == "" {
+		return
+	}
+	if len(line) > maxStderrLineLen {
+		line = line[:maxStderrLineLen] + "…"
+	}
+	c.recentStderrMu.Lock()
+	defer c.recentStderrMu.Unlock()
+	c.recentStderr = append(c.recentStderr, line)
+	if overflow := len(c.recentStderr) - maxRecentStderrLines; overflow > 0 {
+		c.recentStderr = append([]string(nil), c.recentStderr[overflow:]...)
+	}
+}
+
+// RecentStderrSnapshot returns a copy of the recent stderr lines captured
+// from the child process. Returns nil if nothing has been captured yet.
+func (c *Client) RecentStderrSnapshot() []string {
+	c.recentStderrMu.Lock()
+	defer c.recentStderrMu.Unlock()
+	if len(c.recentStderr) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.recentStderr))
+	copy(out, c.recentStderr)
+	return out
+}
+
+// formatRecentStderr returns a human-readable, indented block of recent
+// stderr lines suitable for embedding in an error message. Empty when no
+// stderr has been captured.
+func (c *Client) formatRecentStderr() string {
+	lines := c.RecentStderrSnapshot()
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, l := range lines {
+		b.WriteString("  | ")
+		b.WriteString(l)
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 func shortContainerID(id string) string {
 	if len(id) <= 12 {
 		return id
@@ -312,7 +370,7 @@ func (c *Client) GetConnectionDiagnostics() map[string]interface{} {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		cmd := exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}")
+		cmd := c.newDockerCmd(ctx, "version", "--format", "{{.Server.Version}}")
 		if err := cmd.Run(); err != nil {
 			diagnostics["docker_daemon_reachable"] = false
 			diagnostics["docker_daemon_error"] = err.Error()
@@ -322,7 +380,7 @@ func (c *Client) GetConnectionDiagnostics() map[string]interface{} {
 
 		// Check if container is still running
 		if c.containerID != "" {
-			inspectCmd := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Running}}", c.containerID)
+			inspectCmd := c.newDockerCmd(ctx, "inspect", "--format", "{{.State.Running}}", c.containerID)
 			if output, err := inspectCmd.Output(); err == nil {
 				diagnostics["container_running"] = strings.TrimSpace(string(output)) == "true"
 			}

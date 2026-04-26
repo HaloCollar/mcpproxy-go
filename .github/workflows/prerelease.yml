@@ -18,6 +18,7 @@ jobs:
     # Run on pushes to next branch or prerelease tags
     if: github.ref == 'refs/heads/next' || startsWith(github.ref, 'refs/tags/v') && (contains(github.ref, '-rc.') || contains(github.ref, '-next.'))
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -44,13 +45,13 @@ jobs:
             cgo: "0"
             name: mcpproxy-windows-arm64.exe
             archive_format: zip
-          - os: macos-14
+          - os: macos-15
             goos: darwin
             goarch: amd64
             cgo: "1"
             name: mcpproxy-darwin-amd64
             archive_format: tar.gz
-          - os: macos-14
+          - os: macos-15
             goos: darwin
             goarch: arm64
             cgo: "1"
@@ -185,11 +186,11 @@ jobs:
           CGO_ENABLED: ${{ matrix.cgo }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          # ✅ Force minimum supported macOS version for compatibility
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          # ✅ Force minimum supported macOS version for compatibility (13.0 for Swift tray app)
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
           # Defensive CGO flags to ensure proper deployment target
-          CGO_CFLAGS: "-mmacosx-version-min=12.0"
-          CGO_LDFLAGS: "-mmacosx-version-min=12.0"
+          CGO_CFLAGS: "-mmacosx-version-min=13.0"
+          CGO_LDFLAGS: "-mmacosx-version-min=13.0"
         run: |
           # For prerelease, determine version differently
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
@@ -218,6 +219,21 @@ jobs:
           if [ "${{ matrix.goos }}" = "darwin" ]; then
             echo "Building mcpproxy-tray for macOS..."
             go build -ldflags "${LDFLAGS}" -o mcpproxy-tray ./cmd/mcpproxy-tray
+          fi
+
+          # Build Swift tray app (macOS only — replaces Go tray in .app bundle for DMG/PKG)
+          if [ "${{ matrix.goos }}" = "darwin" ]; then
+            chmod +x scripts/build-swift-app.sh
+            OUTPUT_DIR="$(pwd)/swift-build"
+            mkdir -p "$OUTPUT_DIR"
+            ./scripts/build-swift-app.sh "${VERSION}" "${{ matrix.goarch }}" "$OUTPUT_DIR"
+            SWIFT_APP="$OUTPUT_DIR/MCPProxy.app"
+            if [ -d "$SWIFT_APP" ]; then
+              echo "SWIFT_APP_PATH=$SWIFT_APP" >> $GITHUB_ENV
+            else
+              echo "❌ Swift app build failed"
+              exit 1
+            fi
           fi
 
           # Code sign macOS binaries
@@ -396,6 +412,12 @@ jobs:
             tar -czf "${ARCHIVE_BASE}.tar.gz" ${CLEAN_BINARY}
           fi
 
+      - name: Build Linux .deb and .rpm packages
+        if: matrix.goos == 'linux'
+        uses: ./.github/actions/build-linux-packages
+        with:
+          goarch: ${{ matrix.goarch }}
+
       - name: Install Inno Setup (Windows)
         if: matrix.goos == 'windows'
         shell: pwsh
@@ -455,10 +477,10 @@ jobs:
       - name: Create DMG installer (macOS)
         if: matrix.goos == 'darwin'
         env:
-          # Ensure DMG creation also uses correct deployment target
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
-          CGO_CFLAGS: "-mmacosx-version-min=12.0"
-          CGO_LDFLAGS: "-mmacosx-version-min=12.0"
+          # Ensure DMG creation also uses correct deployment target (13.0 for Swift tray app)
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+          CGO_CFLAGS: "-mmacosx-version-min=13.0"
+          CGO_LDFLAGS: "-mmacosx-version-min=13.0"
         run: |
           # For prerelease, determine version differently (reuse from build step)
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
@@ -476,8 +498,12 @@ jobs:
           TRAY_BINARY="mcpproxy-tray"
           CORE_BINARY="mcpproxy"
 
-          # Create DMG with both tray and core binaries
-          ./scripts/create-dmg.sh ${TRAY_BINARY} ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          # Create DMG with Swift app (preferred) or Go tray binary as fallback
+          if [ -n "${SWIFT_APP_PATH:-}" ]; then
+            ./scripts/create-dmg.sh "$SWIFT_APP_PATH" ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          else
+            ./scripts/create-dmg.sh ${TRAY_BINARY} ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          fi
 
           # Sign DMG
           DMG_NAME="mcpproxy-${VERSION#v}-darwin-${{ matrix.goarch }}.dmg"
@@ -513,10 +539,10 @@ jobs:
       - name: Create PKG installer (macOS)
         if: matrix.goos == 'darwin'
         env:
-          # Ensure PKG creation also uses correct deployment target
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
-          CGO_CFLAGS: "-mmacosx-version-min=12.0"
-          CGO_LDFLAGS: "-mmacosx-version-min=12.0"
+          # Ensure PKG creation also uses correct deployment target (13.0 for Swift tray app)
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+          CGO_CFLAGS: "-mmacosx-version-min=13.0"
+          CGO_LDFLAGS: "-mmacosx-version-min=13.0"
         run: |
           # For prerelease, determine version differently (reuse from build step)
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
@@ -576,9 +602,13 @@ jobs:
           TRAY_BINARY="mcpproxy-tray"
           CORE_BINARY="mcpproxy"
 
-          # Create PKG installer with both tray and core binaries
+          # Create PKG installer with Swift app (preferred) or Go tray binary as fallback
           echo "Creating signed PKG installer with certificate: ${PKG_CERT_IDENTITY}"
-          ./scripts/create-pkg.sh ${TRAY_BINARY} ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          if [ -n "${SWIFT_APP_PATH:-}" ]; then
+            ./scripts/create-pkg.sh "$SWIFT_APP_PATH" ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          else
+            ./scripts/create-pkg.sh ${TRAY_BINARY} ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          fi
 
           # Create installer DMG containing the PKG
           PKG_NAME="mcpproxy-${VERSION#v}-darwin-${{ matrix.goarch }}.pkg"
@@ -746,6 +776,13 @@ jobs:
           find dist -name "*.tar.gz" -o -name "*.zip" | while read file; do
             filename=$(basename "$file")
             cp "$file" "release-files/$filename"
+          done
+
+          # Copy Linux .deb and .rpm packages
+          find dist -path "*/linux-packages-*" \( -name "*.deb" -o -name "*.rpm" \) | while read pkg_file; do
+            filename=$(basename "$pkg_file")
+            echo "Found Linux package: $filename"
+            cp "$pkg_file" "release-files/$filename"
           done
 
           # Copy Windows installer files (.exe)

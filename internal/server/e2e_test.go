@@ -539,26 +539,12 @@ func TestE2E_ToolCalling(t *testing.T) {
 		}
 	}
 
-	// Parse the content response which has format: {"content": [{"type": "text", "text": "..."}]}
-	var contentResponse map[string]interface{}
-	err = json.Unmarshal([]byte(contentText), &contentResponse)
-	require.NoError(t, err)
-
-	// Extract the content array
-	contentArray, ok := contentResponse["content"].([]interface{})
-	require.True(t, ok)
-	require.Greater(t, len(contentArray), 0)
-
-	// Get the first content item
-	firstContent, ok := contentArray[0].(map[string]interface{})
-	require.True(t, ok)
-
-	// Extract the actual JSON response from the text field
-	actualResponseText, ok := firstContent["text"].(string)
-	require.True(t, ok)
-
+	// After the fix for issue #368, the proxy forwards upstream content blocks
+	// as-is. The mock server returned a single TextContent whose text is the
+	// JSON-encoded echo payload, so contentText is that JSON directly (no more
+	// double-wrapping in a {"content":[...]} envelope).
 	var response map[string]interface{}
-	err = json.Unmarshal([]byte(actualResponseText), &response)
+	err = json.Unmarshal([]byte(contentText), &response)
 	require.NoError(t, err)
 
 	assert.Equal(t, "echo_tool", response["tool"])
@@ -877,7 +863,10 @@ func TestE2E_AddUpstreamServerCommand(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Test adding a command-based server (using echo to avoid external dependencies)
+	// Test adding a command-based server (using echo to avoid external dependencies).
+	// Pass quarantined=true explicitly: the E2E test env disables QuarantineEnabled
+	// globally to skip Spec 032 tool-level approval, but this test specifically
+	// verifies the quarantine-by-default server-level behaviour.
 	addRequest := mcp.CallToolRequest{}
 	addRequest.Params.Name = "upstream_servers"
 	addRequest.Params.Arguments = map[string]interface{}{
@@ -890,7 +879,8 @@ func TestE2E_AddUpstreamServerCommand(t *testing.T) {
 		"env": map[string]interface{}{
 			"TEST_KEY": "test_value_123",
 		},
-		"enabled": false, // Disabled to prevent actual connection attempts
+		"enabled":     false, // Disabled to prevent actual connection attempts
+		"quarantined": true,
 	}
 
 	addResult, err := mcpClient.CallTool(ctx, addRequest)
@@ -1019,15 +1009,18 @@ func TestE2E_InspectQuarantined(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Add server (will be automatically quarantined)
+	// Add server quarantined. The E2E test env disables QuarantineEnabled
+	// globally (to skip Spec 032 tool-level approval), so we must ask for
+	// server-level quarantine explicitly here.
 	addRequest := mcp.CallToolRequest{}
 	addRequest.Params.Name = "upstream_servers"
 	addRequest.Params.Arguments = map[string]interface{}{
-		"operation": "add",
-		"name":      "quarantined-server",
-		"url":       mockServer.addr,
-		"protocol":  "streamable-http",
-		"enabled":   true,
+		"operation":   "add",
+		"name":        "quarantined-server",
+		"url":         mockServer.addr,
+		"protocol":    "streamable-http",
+		"enabled":     true,
+		"quarantined": true,
 	}
 
 	addResult, err := mcpClient.CallTool(ctx, addRequest)

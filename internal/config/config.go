@@ -63,10 +63,11 @@ type Config struct {
 	DebugSearch bool            `json:"debug_search" mapstructure:"debug-search"`
 	Servers     []*ServerConfig `json:"mcpServers" mapstructure:"servers"`
 	// Deprecated: TopK is superseded by ToolsLimit and has no runtime effect. Kept for backward compatibility.
-	TopK              int      `json:"top_k,omitempty" mapstructure:"top-k"`
-	ToolsLimit        int      `json:"tools_limit" mapstructure:"tools-limit"`
-	ToolResponseLimit int      `json:"tool_response_limit" mapstructure:"tool-response-limit"`
-	CallToolTimeout   Duration `json:"call_tool_timeout" mapstructure:"call-tool-timeout" swaggertype:"string"`
+	TopK               int      `json:"top_k,omitempty" mapstructure:"top-k"`
+	ToolsLimit         int      `json:"tools_limit" mapstructure:"tools-limit"`
+	ToolResponseLimit  int      `json:"tool_response_limit" mapstructure:"tool-response-limit"`
+	CallToolTimeout    Duration `json:"call_tool_timeout" mapstructure:"call-tool-timeout" swaggertype:"string"`
+	MaxResultSizeChars int      `json:"max_result_size_chars,omitempty" mapstructure:"max-result-size-chars"` // Advertised on every tool as `_meta.anthropic/maxResultSizeChars`; raises Claude Code's inline-response ceiling from 50k to up to 500k chars. Set to 0 to disable.
 
 	// Environment configuration for secure variable filtering
 	Environment *secureenv.EnvConfig `json:"environment,omitempty" mapstructure:"environment"`
@@ -115,6 +116,15 @@ type Config struct {
 	CodeExecutionMaxToolCalls int  `json:"code_execution_max_tool_calls,omitempty" mapstructure:"code-execution-max-tool-calls"` // Max tool calls per execution (0 = unlimited, default: 0)
 	CodeExecutionPoolSize     int  `json:"code_execution_pool_size,omitempty" mapstructure:"code-execution-pool-size"`           // JavaScript runtime pool size (default: 10)
 
+	// ToolResponseSessionRiskWarning controls whether the prose `warning` field
+	// is included in the `session_risk` object returned by `retrieve_tools`.
+	// The structured fields (level, lethal_trifecta, has_open_world_tools, etc.)
+	// are always included. Default: false (quiet for LLM clients) — see issue #406.
+	// Most tools lack annotations, so the MCP-spec defaults treat them as fully
+	// permissive across all three risk axes, which makes the prose warning fire
+	// on almost every call and wastes tokens.
+	ToolResponseSessionRiskWarning bool `json:"tool_response_session_risk_warning,omitempty" mapstructure:"tool-response-session-risk-warning"`
+
 	// Health status settings
 	OAuthExpiryWarningHours float64 `json:"oauth_expiry_warning_hours,omitempty" mapstructure:"oauth-expiry-warning-hours"` // Hours before token expiry to show degraded status (default: 1.0)
 
@@ -130,15 +140,28 @@ type Config struct {
 	// Sensitive data detection settings (Spec 026)
 	SensitiveDataDetection *SensitiveDataDetectionConfig `json:"sensitive_data_detection,omitempty" mapstructure:"sensitive-data-detection"`
 
+	// Telemetry settings (Spec 036)
+	Telemetry *TelemetryConfig `json:"telemetry,omitempty" mapstructure:"telemetry"`
+
 	// Routing mode (Spec 031): how MCP tools are exposed to clients
 	// Valid values: "retrieve_tools" (default), "direct", "code_execution"
 	RoutingMode string `json:"routing_mode,omitempty" mapstructure:"routing-mode"`
 
-	// Tool-level quarantine settings (Spec 032)
-	// QuarantineEnabled controls whether tool-level quarantine is active.
-	// When nil (default), quarantine is enabled (secure by default).
-	// Set to explicit false to disable tool-level quarantine.
+	// QuarantineEnabled controls whether quarantine is active. It gates two
+	// things together:
+	//   1. Server-level auto-quarantine for newly added servers (issue #370).
+	//      When true, servers added via the upstream_servers MCP tool or the
+	//      REST API default to quarantined=true; when false, they default to
+	//      quarantined=false. Explicit per-request values always win.
+	//   2. Tool-level quarantine (Spec 032): per-tool SHA-256 approval of
+	//      tool descriptions/schemas.
+	// When nil (default), quarantine is enabled (secure by default). Set to
+	// explicit false to opt out of both. Per-server SkipQuarantine still
+	// applies for the tool-level check on individual servers.
 	QuarantineEnabled *bool `json:"quarantine_enabled,omitempty" mapstructure:"quarantine-enabled"`
+
+	// Security scanner settings (Spec 039)
+	Security *SecurityConfig `json:"security,omitempty" mapstructure:"security"`
 
 	// Server edition multi-user configuration (only meaningful with -tags server)
 	Teams *TeamsConfig `json:"teams,omitempty" mapstructure:"teams" swaggerignore:"true"`
@@ -190,7 +213,8 @@ type ServerConfig struct {
 	Shared         bool              `json:"shared,omitempty" mapstructure:"shared"`                   // Server edition: shared with all users
 	Created        time.Time         `json:"created" mapstructure:"created"`
 	Updated        time.Time         `json:"updated,omitempty" mapstructure:"updated"`
-	Isolation      *IsolationConfig  `json:"isolation,omitempty" mapstructure:"isolation"` // Per-server isolation settings
+	Isolation      *IsolationConfig  `json:"isolation,omitempty" mapstructure:"isolation"`               // Per-server isolation settings
+	ReconnectOnUse bool              `json:"reconnect_on_use,omitempty" mapstructure:"reconnect-on-use"` // Attempt reconnection when a tool call targets a disconnected server
 }
 
 // OAuthConfig represents OAuth configuration for a server
@@ -205,17 +229,18 @@ type OAuthConfig struct {
 
 // DockerIsolationConfig represents global Docker isolation settings
 type DockerIsolationConfig struct {
-	Enabled       bool              `json:"enabled" mapstructure:"enabled"`                                // Global enable/disable for Docker isolation
-	DefaultImages map[string]string `json:"default_images" mapstructure:"default_images"`                  // Map of runtime type to Docker image
-	Registry      string            `json:"registry,omitempty" mapstructure:"registry"`                    // Custom registry (defaults to docker.io)
-	NetworkMode   string            `json:"network_mode,omitempty" mapstructure:"network_mode"`            // Docker network mode (default: bridge)
-	MemoryLimit   string            `json:"memory_limit,omitempty" mapstructure:"memory_limit"`            // Memory limit for containers
-	CPULimit      string            `json:"cpu_limit,omitempty" mapstructure:"cpu_limit"`                  // CPU limit for containers
-	Timeout       Duration          `json:"timeout,omitempty" mapstructure:"timeout" swaggertype:"string"` // Container startup timeout
-	ExtraArgs     []string          `json:"extra_args,omitempty" mapstructure:"extra_args"`                // Additional docker run arguments
-	LogDriver     string            `json:"log_driver,omitempty" mapstructure:"log_driver"`                // Docker log driver (default: json-file)
-	LogMaxSize    string            `json:"log_max_size,omitempty" mapstructure:"log_max_size"`            // Maximum size of log files (default: 100m)
-	LogMaxFiles   string            `json:"log_max_files,omitempty" mapstructure:"log_max_files"`          // Maximum number of log files (default: 3)
+	Enabled           bool              `json:"enabled" mapstructure:"enabled"`                                // Global enable/disable for Docker isolation
+	EnableCacheVolume bool              `json:"enable_cache_volume" mapstructure:"enable_cache_volume"`        // Mount shared cache volumes for faster restarts (default: true)
+	DefaultImages     map[string]string `json:"default_images" mapstructure:"default_images"`                  // Map of runtime type to Docker image
+	Registry          string            `json:"registry,omitempty" mapstructure:"registry"`                    // Custom registry (defaults to docker.io)
+	NetworkMode       string            `json:"network_mode,omitempty" mapstructure:"network_mode"`            // Docker network mode (default: bridge)
+	MemoryLimit       string            `json:"memory_limit,omitempty" mapstructure:"memory_limit"`            // Memory limit for containers
+	CPULimit          string            `json:"cpu_limit,omitempty" mapstructure:"cpu_limit"`                  // CPU limit for containers
+	Timeout           Duration          `json:"timeout,omitempty" mapstructure:"timeout" swaggertype:"string"` // Container startup timeout
+	ExtraArgs         []string          `json:"extra_args,omitempty" mapstructure:"extra_args"`                // Additional docker run arguments
+	LogDriver         string            `json:"log_driver,omitempty" mapstructure:"log_driver"`                // Docker log driver (default: json-file)
+	LogMaxSize        string            `json:"log_max_size,omitempty" mapstructure:"log_max_size"`            // Maximum size of log files (default: 100m)
+	LogMaxFiles       string            `json:"log_max_files,omitempty" mapstructure:"log_max_files"`          // Maximum number of log files (default: 3)
 }
 
 // IsolationConfig represents per-server isolation settings
@@ -543,20 +568,21 @@ type ToolStatEntry struct {
 // DefaultDockerIsolationConfig returns default Docker isolation configuration
 func DefaultDockerIsolationConfig() *DockerIsolationConfig {
 	return &DockerIsolationConfig{
-		Enabled: false, // Disabled by default for backward compatibility
+		Enabled:           false, // Disabled by default for backward compatibility
+		EnableCacheVolume: true,  // Cache volumes speed up container restarts dramatically
 		DefaultImages: map[string]string{
-			// Python environments - using full images for Git and build tool support
-			"python":  "python:3.11",
-			"python3": "python:3.11",
-			"uvx":     "python:3.11", // Full image needed for git+https:// installs
-			"pip":     "python:3.11",
-			"pipx":    "python:3.11",
+			// Python environments - single uv image for all Python commands (includes python, pip, uvx)
+			"python":  "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+			"python3": "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+			"uvx":     "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+			"pip":     "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
+			"pipx":    "ghcr.io/astral-sh/uv:python3.13-bookworm-slim",
 
-			// Node.js environments - using full images for Git and native module support
-			"node": "node:20",
-			"npm":  "node:20",
-			"npx":  "node:20", // Full image needed for git dependencies and native modules
-			"yarn": "node:20",
+			// Node.js environments - full image for git deps and native modules (LTS until Apr 2028)
+			"node": "node:22",
+			"npm":  "node:22",
+			"npx":  "node:22",
+			"yarn": "node:22",
 
 			// Go binaries
 			"go": "golang:1.21-alpine",
@@ -595,14 +621,15 @@ func DefaultDockerIsolationConfig() *DockerIsolationConfig {
 // DefaultConfig returns a default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Listen:            defaultPort,
-		EnableSocket:      true, // Enable Unix socket/named pipe by default for local IPC
-		DataDir:           "",   // Will be set to ~/.mcpproxy by loader
-		DebugSearch:       false,
-		Servers:           []*ServerConfig{},
-		ToolsLimit:        15,
-		ToolResponseLimit: 20000,                     // Default 20000 characters
-		CallToolTimeout:   Duration(2 * time.Minute), // Default 2 minutes for tool calls
+		Listen:             defaultPort,
+		EnableSocket:       true, // Enable Unix socket/named pipe by default for local IPC
+		DataDir:            "",   // Will be set to ~/.mcpproxy by loader
+		DebugSearch:        false,
+		Servers:            []*ServerConfig{},
+		ToolsLimit:         15,
+		ToolResponseLimit:  20000,                     // Default 20000 characters
+		CallToolTimeout:    Duration(2 * time.Minute), // Default 2 minutes for tool calls
+		MaxResultSizeChars: 500000,                    // Claude Code's inline-response hard max
 
 		// Default secure environment configuration
 		Environment: secureenv.DefaultEnvConfig(),
@@ -715,6 +742,11 @@ func DefaultConfig() *Config {
 		CodeExecutionMaxToolCalls: 0,      // Unlimited by default (0 = no limit)
 		CodeExecutionPoolSize:     10,     // 10 JavaScript runtime instances
 
+		// Session risk warning prose disabled by default to reduce token overhead
+		// and LLM distraction in trusted setups (issue #406). Structured risk
+		// fields are still emitted; only the prose `warning` is gated.
+		ToolResponseSessionRiskWarning: false,
+
 		// Activity logging defaults (RFC-003)
 		ActivityRetentionDays:      90,     // 90 days retention
 		ActivityMaxRecords:         100000, // 100K records max
@@ -759,13 +791,23 @@ func (s APIKeySource) String() string {
 	}
 }
 
-// IsQuarantineEnabled returns whether tool-level quarantine is enabled.
-// Defaults to true (secure by default) when not explicitly set.
+// IsQuarantineEnabled returns whether quarantine (both server-level
+// auto-quarantine and tool-level approval) is enabled. Defaults to true
+// (secure by default) when not explicitly set.
 func (c *Config) IsQuarantineEnabled() bool {
 	if c.QuarantineEnabled == nil {
 		return true
 	}
 	return *c.QuarantineEnabled
+}
+
+// DefaultQuarantineForNewServer returns the default value for the
+// Quarantined field when a new server is added via an API that does not
+// explicitly specify it (MCP upstream_servers tool, REST /api/v1/servers).
+// Secure by default: true unless the operator has disabled quarantine
+// globally via quarantine_enabled=false.
+func (c *Config) DefaultQuarantineForNewServer() bool {
+	return c.IsQuarantineEnabled()
 }
 
 // IsQuarantineSkipped returns whether this server should skip tool-level quarantine.
@@ -1135,4 +1177,76 @@ func OAuthConfigChanged(old, new *OAuthConfig) bool {
 	}
 
 	return false
+}
+
+// TelemetryConfig controls anonymous usage telemetry (Spec 036, extended in Spec 042).
+type TelemetryConfig struct {
+	Enabled     *bool  `json:"enabled,omitempty" mapstructure:"enabled"`           // Default: true (opt-out)
+	AnonymousID string `json:"anonymous_id,omitempty" mapstructure:"anonymous-id"` // Auto-generated UUIDv4
+	Endpoint    string `json:"endpoint,omitempty" mapstructure:"endpoint"`         // Override for testing
+
+	// Spec 042 (Tier 2) additions — all default-zero, all backwards-compatible.
+	AnonymousIDCreatedAt string `json:"anonymous_id_created_at,omitempty" mapstructure:"anonymous-id-created-at"` // RFC3339; for annual rotation
+	LastReportedVersion  string `json:"last_reported_version,omitempty" mapstructure:"last-reported-version"`     // Upgrade funnel
+	LastStartupOutcome   string `json:"last_startup_outcome,omitempty" mapstructure:"last-startup-outcome"`       // success|port_conflict|db_locked|...
+	NoticeShown          bool   `json:"notice_shown,omitempty" mapstructure:"notice-shown"`                       // First-run notice flag
+}
+
+// IsTelemetryEnabled returns whether telemetry is enabled.
+// Respects MCPPROXY_TELEMETRY=false env var override and defaults to true.
+func (c *Config) IsTelemetryEnabled() bool {
+	if os.Getenv("MCPPROXY_TELEMETRY") == "false" {
+		return false
+	}
+	if c.Telemetry == nil {
+		return true // default enabled
+	}
+	if c.Telemetry.Enabled == nil {
+		return true
+	}
+	return *c.Telemetry.Enabled
+}
+
+// GetTelemetryEndpoint returns the telemetry endpoint URL.
+func (c *Config) GetTelemetryEndpoint() string {
+	if c.Telemetry != nil && c.Telemetry.Endpoint != "" {
+		return c.Telemetry.Endpoint
+	}
+	return "https://telemetry.mcpproxy.app/v1"
+}
+
+// GetAnonymousID returns the anonymous telemetry ID if set.
+func (c *Config) GetAnonymousID() string {
+	if c.Telemetry != nil && c.Telemetry.AnonymousID != "" {
+		return c.Telemetry.AnonymousID
+	}
+	return ""
+}
+
+// SecurityConfig represents security scanner configuration (Spec 039)
+type SecurityConfig struct {
+	AutoScanQuarantined     bool     `json:"auto_scan_quarantined" mapstructure:"auto-scan-quarantined"`
+	ScanTimeoutDefault      Duration `json:"scan_timeout_default,omitempty" mapstructure:"scan-timeout-default" swaggertype:"string"`
+	IntegrityCheckInterval  Duration `json:"integrity_check_interval,omitempty" mapstructure:"integrity-check-interval" swaggertype:"string"`
+	IntegrityCheckOnRestart bool     `json:"integrity_check_on_restart" mapstructure:"integrity-check-on-restart"`
+	ScannerRegistryURL      string   `json:"scanner_registry_url,omitempty" mapstructure:"scanner-registry-url"`
+	RuntimeReadOnly         bool     `json:"runtime_read_only" mapstructure:"runtime-read-only"`
+	RuntimeTmpfsSize        string   `json:"runtime_tmpfs_size,omitempty" mapstructure:"runtime-tmpfs-size"`
+
+	// ScannerDisableNoNewPrivileges, when true, omits the
+	// `--security-opt no-new-privileges` flag from scanner container runs.
+	//
+	// Background: snap-installed Docker on Ubuntu confines dockerd under the
+	// `snap.docker.dockerd` AppArmor profile. When runc tries to transition
+	// the container into the inner `docker-default` profile to exec the
+	// entrypoint, AppArmor refuses the transition because NO_NEW_PRIVS
+	// forbids privilege/profile changes on exec — the result is EPERM
+	// ("operation not permitted") and every scanner fails immediately.
+	//
+	// Set this to true ONLY on hosts hitting that incompatibility. Scanner
+	// containers still run with read-only rootfs, tmpfs /tmp, no-network by
+	// default, and read-only source mounts, so the marginal isolation loss
+	// is small. The preferred fix remains replacing snap docker with a
+	// distro-packaged docker.
+	ScannerDisableNoNewPrivileges bool `json:"scanner_disable_no_new_privileges,omitempty" mapstructure:"scanner-disable-no-new-privileges"`
 }

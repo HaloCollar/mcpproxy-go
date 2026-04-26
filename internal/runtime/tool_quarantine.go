@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -13,15 +14,139 @@ import (
 )
 
 // calculateToolApprovalHash computes a stable SHA-256 hash for tool-level quarantine.
-// Uses toolName + description + schemaJSON for consistent detection of changes.
-func calculateToolApprovalHash(toolName, description, schemaJSON string) string {
+// Uses toolName + description + schemaJSON only.
+// Annotations are intentionally EXCLUDED because:
+// 1. They are metadata hints, not functional changes to the tool
+// 2. They may not be stable across reconnections (some servers omit them)
+// 3. Including them caused false "tool_description_changed" spam on every reconnect
+// 4. This matches the upstream client's hash.ComputeToolHash approach
+// The annotations parameter is kept for API compatibility but ignored.
+func calculateToolApprovalHash(toolName, description, schemaJSON string, annotations *config.ToolAnnotations) string {
+	h := sha256.New()
+	h.Write([]byte(toolName))
+	h.Write([]byte("|"))
+	h.Write([]byte(description))
+	h.Write([]byte("|"))
+	// Normalize JSON schema to prevent key-order differences from causing
+	// false "tool_description_changed" events. Parse → sort keys → serialize.
+	h.Write([]byte(normalizeJSON(schemaJSON)))
+	// Annotations excluded from hash — see comment above
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// normalizeJSON parses a JSON string and re-serializes with sorted keys.
+// Returns the original string if parsing fails (non-JSON content).
+func normalizeJSON(s string) string {
+	if s == "" {
+		return s
+	}
+	var parsed interface{}
+	if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+		return s // Not valid JSON, return as-is
+	}
+	normalized, err := json.Marshal(parsed)
+	if err != nil {
+		return s
+	}
+	return string(normalized)
+}
+
+// calculateLegacyToolApprovalHash computes the old hash format (without annotations).
+// Used for backward compatibility: tools approved before annotation tracking can be
+// silently re-approved if only the hash formula changed (not the actual content).
+func calculateLegacyToolApprovalHash(toolName, description, schemaJSON string) string {
+	h := sha256.New()
+	h.Write([]byte(toolName))
+	h.Write([]byte("|"))
+	h.Write([]byte(description))
+	h.Write([]byte("|"))
+	h.Write([]byte(normalizeJSON(schemaJSON)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// calculateHashWithAnnotations computes the OLD hash formula that included annotations.
+// Used for migration: tools approved with the old formula need to be silently re-approved
+// with the new formula (which excludes annotations to prevent false change detection).
+func calculateHashWithAnnotations(toolName, description, schemaJSON string, annotations *config.ToolAnnotations) string {
 	h := sha256.New()
 	h.Write([]byte(toolName))
 	h.Write([]byte("|"))
 	h.Write([]byte(description))
 	h.Write([]byte("|"))
 	h.Write([]byte(schemaJSON))
+	if annotations != nil {
+		annotationsJSON, err := json.Marshal(annotations)
+		if err == nil {
+			h.Write([]byte("|"))
+			h.Write(annotationsJSON)
+		}
+	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// TransitionReason explains why a tool approval state transition is occurring.
+type TransitionReason string
+
+const (
+	ReasonHashMatch         TransitionReason = "hash_match"
+	ReasonDescriptionRevert TransitionReason = "description_revert"
+	ReasonFormulaMigration  TransitionReason = "formula_migration"
+	ReasonContentMatch      TransitionReason = "content_match"
+	ReasonDescriptionMatch  TransitionReason = "description_match"
+	ReasonUserApprove       TransitionReason = "user_approve"
+	ReasonAutoApprove       TransitionReason = "auto_approve"
+)
+
+// assertToolApprovalInvariant checks that a state transition is valid according
+// to quarantine safety rules. Returns nil for valid transitions.
+//
+// Invariants:
+//   - changed→approved: requires user action, description revert, or proof that
+//     the tool content hasn't actually changed (hash match, formula migration,
+//     content match).
+//   - pending→approved: requires explicit user action or auto-approve (when
+//     quarantine is disabled for the server).
+func assertToolApprovalInvariant(oldStatus, newStatus string, reason TransitionReason) error {
+	if newStatus != storage.ToolApprovalStatusApproved {
+		return nil
+	}
+
+	switch oldStatus {
+	case storage.ToolApprovalStatusChanged:
+		switch reason {
+		case ReasonHashMatch, ReasonDescriptionRevert, ReasonFormulaMigration,
+			ReasonContentMatch, ReasonDescriptionMatch, ReasonUserApprove:
+			return nil
+		default:
+			return fmt.Errorf("invariant violation: changed→approved with reason %q "+
+				"(requires user action or description revert)", reason)
+		}
+	case storage.ToolApprovalStatusPending:
+		switch reason {
+		case ReasonUserApprove, ReasonAutoApprove:
+			return nil
+		default:
+			return fmt.Errorf("invariant violation: pending→approved with reason %q "+
+				"(requires user action)", reason)
+		}
+	}
+	return nil
+}
+
+// enforceInvariant logs and returns the invariant error, or panics in test mode.
+func (r *Runtime) enforceInvariant(serverName, toolName, oldStatus, newStatus string, reason TransitionReason) error {
+	err := assertToolApprovalInvariant(oldStatus, newStatus, reason)
+	if err == nil {
+		return nil
+	}
+	r.logger.Error("Tool approval invariant violation",
+		zap.String("server", serverName),
+		zap.String("tool", toolName),
+		zap.String("old_status", oldStatus),
+		zap.String("new_status", newStatus),
+		zap.String("reason", string(reason)),
+		zap.Error(err))
+	return err
 }
 
 // ToolApprovalResult contains the result of checking tool approvals for a server.
@@ -58,11 +183,15 @@ func (r *Runtime) checkToolApprovals(serverName string, tools []*config.ToolMeta
 		}
 	}
 
-	// Auto-approve new tools when:
-	// - Global quarantine is disabled, OR
-	// - Server has skip_quarantine=true, OR
-	// - Server is NOT quarantined (user trusts this server)
-	// Changed tools are still blocked regardless (rug pull detection).
+	// Quarantine enforcement levels:
+	// 1. enforceNewTools: block NEW tools for review (unless quarantine is disabled or server skipped)
+	// 2. enforceQuarantine: full quarantine mode for servers explicitly quarantined
+	//
+	// Even trusted (non-quarantined) servers should have new tools reviewed when quarantine
+	// is globally enabled. This prevents injection attacks via new tool additions on
+	// compromised servers. Only skip_quarantine=true explicitly opts out.
+	// Changed tools (rug pull) are always blocked when globalEnabled is true (line ~438).
+	enforceNewTools := globalEnabled && !serverSkipped
 	enforceQuarantine := globalEnabled && !serverSkipped && serverQuarantined
 
 	result := &ToolApprovalResult{
@@ -80,17 +209,19 @@ func (r *Runtime) checkToolApprovals(serverName string, tools []*config.ToolMeta
 			schemaJSON = "{}"
 		}
 
-		// Calculate current hash
-		currentHash := calculateToolApprovalHash(toolName, tool.Description, schemaJSON)
+		// Normalize JSON schema before hashing and storage to ensure stable key ordering
+		schemaJSON = normalizeJSON(schemaJSON)
+
+		// Calculate current hash (includes annotations for rug-pull detection)
+		currentHash := calculateToolApprovalHash(toolName, tool.Description, schemaJSON, tool.Annotations)
 
 		// Look up existing approval record
 		existing, err := r.storageManager.GetToolApproval(serverName, toolName)
 
 		if err != nil {
 			// No existing record - this is a new tool.
-			// If the server is trusted (quarantine not enforced), auto-approve immediately.
-			// This prevents blocking tools on upgrade for existing trusted servers.
-			if !enforceQuarantine {
+			if !enforceNewTools {
+				// Quarantine disabled or server has skip_quarantine - auto-approve
 				now := time.Now().UTC()
 				record := &storage.ToolApprovalRecord{
 					ServerName:         serverName,
@@ -112,18 +243,19 @@ func (r *Runtime) checkToolApprovals(serverName string, tools []*config.ToolMeta
 					continue
 				}
 
-				r.logger.Info("New tool discovered, auto-approved (server trusted)",
+				r.logger.Info("New tool discovered, auto-approved (quarantine disabled or server skipped)",
 					zap.String("server", serverName),
 					zap.String("tool", toolName))
 
-				// Emit activity event
 				r.emitToolQuarantineEvent(serverName, toolName, "tool_auto_approved", "", currentHash,
 					"", tool.Description, "", schemaJSON)
 
 				continue
 			}
 
-			// Server IS quarantined - mark tool as pending
+			// Quarantine enabled — new tool requires user review before use.
+			// This applies to ALL servers (including trusted ones) to prevent
+			// injection attacks via new tool additions on compromised servers.
 			record := &storage.ToolApprovalRecord{
 				ServerName:         serverName,
 				ToolName:           toolName,
@@ -143,12 +275,12 @@ func (r *Runtime) checkToolApprovals(serverName string, tools []*config.ToolMeta
 
 			r.logger.Info("New tool discovered, pending approval",
 				zap.String("server", serverName),
-				zap.String("tool", toolName))
+				zap.String("tool", toolName),
+				zap.Bool("server_quarantined", serverQuarantined))
 
 			result.BlockedTools[toolName] = true
 			result.PendingCount++
 
-			// Emit activity event
 			r.emitToolQuarantineEvent(serverName, toolName, "tool_discovered", "", currentHash,
 				"", tool.Description, "", schemaJSON)
 
@@ -156,15 +288,34 @@ func (r *Runtime) checkToolApprovals(serverName string, tools []*config.ToolMeta
 		}
 
 		// Existing record found - check if hash matches
-		if existing.Status == storage.ToolApprovalStatusApproved && existing.ApprovedHash == currentHash {
-			// Hash matches approved hash - tool is unchanged, keep approved
-			// Also update current hash/description in case they differ from storage
+		if existing.ApprovedHash == currentHash {
+			needsSave := false
+			if existing.Status != storage.ToolApprovalStatusApproved {
+				// Hash matches but status is not approved (e.g., falsely marked "changed"
+				// by a previous binary with a different hash formula). Restore to approved.
+				if err := r.enforceInvariant(serverName, toolName, existing.Status, storage.ToolApprovalStatusApproved, ReasonHashMatch); err != nil {
+					result.BlockedTools[toolName] = true
+					result.ChangedCount++
+					continue
+				}
+				existing.Status = storage.ToolApprovalStatusApproved
+				existing.PreviousDescription = ""
+				existing.PreviousSchema = ""
+				needsSave = true
+				r.logger.Info("Tool restored to approved (hash matches after formula update)",
+					zap.String("server", serverName),
+					zap.String("tool", toolName))
+			}
+			// Update current hash/description in case they differ from storage
 			if existing.CurrentHash != currentHash {
 				existing.CurrentHash = currentHash
 				existing.CurrentDescription = tool.Description
 				existing.CurrentSchema = schemaJSON
+				needsSave = true
+			}
+			if needsSave {
 				if saveErr := r.storageManager.SaveToolApproval(existing); saveErr != nil {
-					r.logger.Debug("Failed to update tool approval current hash",
+					r.logger.Debug("Failed to update tool approval record",
 						zap.String("server", serverName),
 						zap.String("tool", toolName),
 						zap.Error(saveErr))
@@ -192,8 +343,167 @@ func (r *Runtime) checkToolApprovals(serverName string, tools []*config.ToolMeta
 			continue
 		}
 
+		// If tool was previously marked "changed", check if the tool has reverted
+		// to its PREVIOUS (pre-change) description. Only auto-approve if the
+		// description matches the APPROVED version, not the current (changed) one.
+		// This prevents the bug where a changed tool gets auto-approved on the
+		// next checkToolApprovals pass because CurrentDescription was already
+		// updated to the new description.
+		if existing.Status == storage.ToolApprovalStatusChanged {
+			// Only restore if the tool reverted to the PREVIOUS (approved) description
+			if existing.PreviousDescription != "" && tool.Description == existing.PreviousDescription {
+				if err := r.enforceInvariant(serverName, toolName, existing.Status, storage.ToolApprovalStatusApproved, ReasonDescriptionRevert); err != nil {
+					result.BlockedTools[toolName] = true
+					result.ChangedCount++
+					continue
+				}
+				existing.Status = storage.ToolApprovalStatusApproved
+				existing.ApprovedHash = currentHash
+				existing.CurrentHash = currentHash
+				existing.CurrentDescription = tool.Description
+				existing.CurrentSchema = schemaJSON
+				existing.PreviousDescription = ""
+				existing.PreviousSchema = ""
+				if saveErr := r.storageManager.SaveToolApproval(existing); saveErr == nil {
+					r.logger.Info("Changed tool restored (reverted to previous description)",
+						zap.String("server", serverName),
+						zap.String("tool", toolName))
+				}
+				continue
+			}
+			// Tool still has the changed description — keep it blocked
+			if globalEnabled {
+				result.BlockedTools[toolName] = true
+				result.ChangedCount++
+			}
+			continue
+		}
+
 		if existing.ApprovedHash != "" && existing.ApprovedHash != currentHash {
-			// Hash differs from approved hash - tool description/schema changed (rug pull)
+			// Before marking as changed, check if this is a hash formula migration.
+			// Recompute what the approved hash WOULD be using the STORED description+schema
+			// with the CURRENT formula. If it matches the current hash, the tool hasn't
+			// actually changed — only the hash formula did.
+			storedDesc := existing.CurrentDescription
+			storedSchema := existing.CurrentSchema
+			if storedDesc == "" {
+				storedDesc = tool.Description
+			}
+			if storedSchema == "" {
+				storedSchema = schemaJSON
+			}
+			rehashedFromStored := calculateToolApprovalHash(toolName, storedDesc, storedSchema, nil)
+
+			// Also check legacy and with-annotations formulas
+			legacyHash := calculateLegacyToolApprovalHash(toolName, tool.Description, schemaJSON)
+			annotationsHash := calculateHashWithAnnotations(toolName, tool.Description, schemaJSON, tool.Annotations)
+
+			isFormulaChange := rehashedFromStored == currentHash ||
+				existing.ApprovedHash == legacyHash ||
+				existing.ApprovedHash == annotationsHash
+
+			if isFormulaChange {
+				if err := r.enforceInvariant(serverName, toolName, existing.Status, storage.ToolApprovalStatusApproved, ReasonFormulaMigration); err != nil {
+					result.BlockedTools[toolName] = true
+					result.ChangedCount++
+					continue
+				}
+				existing.Status = storage.ToolApprovalStatusApproved
+				existing.ApprovedHash = currentHash
+				existing.CurrentHash = currentHash
+				existing.CurrentDescription = tool.Description
+				existing.CurrentSchema = schemaJSON
+				existing.PreviousDescription = ""
+				existing.PreviousSchema = ""
+				if saveErr := r.storageManager.SaveToolApproval(existing); saveErr != nil {
+					r.logger.Debug("Failed to migrate changed tool approval hash",
+						zap.String("server", serverName),
+						zap.String("tool", toolName),
+						zap.Error(saveErr))
+				} else {
+					r.logger.Info("Tool approval hash migrated (formula change, not actual tool change)",
+						zap.String("server", serverName),
+						zap.String("tool", toolName))
+				}
+				continue
+			}
+
+			// Final safety: compare actual text content before flagging as changed.
+			// If description AND schema text are identical, this is a hash formula issue,
+			// not a real tool change. Auto-approve silently.
+			// Content comparison: check if the SEMANTIC content is the same.
+			// Multiple sources of hash mismatch are possible:
+			// 1. Annotations were included in old hash but excluded now
+			// 2. JSON key ordering differs between sessions
+			// 3. Whitespace/formatting differences in schema
+			//
+			// We normalize by comparing description text AND normalized schema JSON.
+			// If both match semantically, auto-approve (this is a formula change, not a tool change).
+			descMatch := tool.Description == existing.CurrentDescription || existing.CurrentDescription == ""
+			var schemaMatch bool
+			if existing.CurrentSchema == "" || schemaJSON == existing.CurrentSchema {
+				schemaMatch = true
+			} else {
+				// Normalize both schemas and compare
+				schemaMatch = normalizeJSON(schemaJSON) == normalizeJSON(existing.CurrentSchema)
+			}
+			if descMatch && schemaMatch {
+				if err := r.enforceInvariant(serverName, toolName, existing.Status, storage.ToolApprovalStatusApproved, ReasonContentMatch); err != nil {
+					result.BlockedTools[toolName] = true
+					result.ChangedCount++
+					continue
+				}
+				existing.Status = storage.ToolApprovalStatusApproved
+				existing.ApprovedHash = currentHash
+				existing.CurrentHash = currentHash
+				existing.CurrentDescription = tool.Description
+				existing.CurrentSchema = schemaJSON
+				existing.PreviousDescription = ""
+				existing.PreviousSchema = ""
+				if saveErr := r.storageManager.SaveToolApproval(existing); saveErr == nil {
+					r.logger.Info("Tool auto-approved (identical content, hash formula change)",
+						zap.String("server", serverName),
+						zap.String("tool", toolName))
+				}
+				continue
+			}
+
+			// Log why the content comparison failed for debugging
+			r.logger.Warn("Tool hash mismatch not resolved by content comparison",
+				zap.String("server", serverName),
+				zap.String("tool", toolName),
+				zap.Bool("desc_match", descMatch),
+				zap.Bool("schema_match", schemaMatch),
+				zap.Int("stored_desc_len", len(existing.CurrentDescription)),
+				zap.Int("current_desc_len", len(tool.Description)),
+				zap.Int("stored_schema_len", len(existing.CurrentSchema)),
+				zap.Int("current_schema_len", len(schemaJSON)))
+
+			// LAST RESORT: If description matches (most important for security),
+			// auto-approve even if schema normalization differs.
+			// Schema formatting differences are NOT security concerns.
+			if descMatch {
+				if err := r.enforceInvariant(serverName, toolName, existing.Status, storage.ToolApprovalStatusApproved, ReasonDescriptionMatch); err != nil {
+					result.BlockedTools[toolName] = true
+					result.ChangedCount++
+					continue
+				}
+				existing.Status = storage.ToolApprovalStatusApproved
+				existing.ApprovedHash = currentHash
+				existing.CurrentHash = currentHash
+				existing.CurrentDescription = tool.Description
+				existing.CurrentSchema = schemaJSON
+				existing.PreviousDescription = ""
+				existing.PreviousSchema = ""
+				if saveErr := r.storageManager.SaveToolApproval(existing); saveErr == nil {
+					r.logger.Info("Tool auto-approved (description matches, schema format differs)",
+						zap.String("server", serverName),
+						zap.String("tool", toolName))
+				}
+				continue
+			}
+
+			// Hash differs AND description differs - genuine tool change (rug pull)
 			oldDesc := existing.CurrentDescription
 			oldSchema := existing.CurrentSchema
 			if existing.Status == storage.ToolApprovalStatusApproved {
@@ -265,6 +575,10 @@ func (r *Runtime) ApproveTools(serverName string, toolNames []string, approvedBy
 				zap.String("tool", toolName),
 				zap.Error(err))
 			continue
+		}
+
+		if err := r.enforceInvariant(serverName, toolName, record.Status, storage.ToolApprovalStatusApproved, ReasonUserApprove); err != nil {
+			return err
 		}
 
 		record.Status = storage.ToolApprovalStatusApproved

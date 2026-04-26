@@ -20,7 +20,9 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/auth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/connect"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/health"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/httpapi"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
@@ -28,7 +30,9 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/observability"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security/scanner"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tlslocal"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
@@ -68,6 +72,9 @@ type Server struct {
 	// Spec 024: Track server start time for lifecycle events
 	startTime time.Time
 
+	// Spec 039: Security scanner service (for scan summaries in server list)
+	securityScanner *scanner.Service
+
 	// Spec 024: Shutdown info for lifecycle events
 	shutdownReason string
 	shutdownSignal string
@@ -88,6 +95,9 @@ func NewServerWithConfigPath(cfg *config.Config, configPath string, logger *zap.
 	// Initialize update checker with build version
 	// This must happen before StartBackgroundInitialization is called
 	rt.SetVersion(httpapi.GetBuildVersion())
+
+	// Initialize telemetry service with build version and edition (Spec 036)
+	rt.SetTelemetry(httpapi.GetBuildVersion(), httpapi.GetEdition())
 
 	// Initialize observability manager for metrics (FR-011: OAuth refresh metrics)
 	obsConfig := observability.DefaultConfig("mcpproxy", httpapi.GetBuildVersion())
@@ -790,14 +800,26 @@ func (s *Server) GetAllServers() ([]map[string]interface{}, error) {
 			}
 		}
 
-		// Extract created time and config fields
+		// Extract created time and config fields from stateview or fall back to storage
 		var created time.Time
-		var url, command, protocol string
-		if serverStatus.Config != nil {
-			created = serverStatus.Config.Created
-			url = serverStatus.Config.URL
-			command = serverStatus.Config.Command
-			protocol = serverStatus.Config.Protocol
+		var url, command, protocol, workingDir string
+		var args []string
+		cfg := serverStatus.Config
+		if cfg == nil {
+			// Stateview Config is nil — fall back to storage for config fields
+			if storageManager := s.runtime.StorageManager(); storageManager != nil {
+				if stored, err := storageManager.GetUpstreamServer(serverStatus.Name); err == nil && stored != nil {
+					cfg = stored
+				}
+			}
+		}
+		if cfg != nil {
+			created = cfg.Created
+			url = cfg.URL
+			command = cfg.Command
+			args = cfg.Args
+			workingDir = cfg.WorkingDir
+			protocol = cfg.Protocol
 		}
 
 		// Calculate unified health status (Spec 013: Health is single source of truth)
@@ -831,10 +853,12 @@ func (s *Server) GetAllServers() ([]map[string]interface{}, error) {
 
 		healthStatus := health.CalculateHealth(healthInput, health.DefaultHealthConfig())
 
-		result = append(result, map[string]interface{}{
+		serverMap := map[string]interface{}{
 			"name":            serverStatus.Name,
 			"url":             url,
 			"command":         command,
+			"args":            args,
+			"working_dir":     workingDir,
 			"protocol":        protocol,
 			"enabled":         serverStatus.Enabled,
 			"quarantined":     serverStatus.Quarantined,
@@ -848,7 +872,35 @@ func (s *Server) GetAllServers() ([]map[string]interface{}, error) {
 			"retry_count":     serverStatus.RetryCount,
 			"last_retry_time": nil,          // Actor tracks this internally
 			"health":          healthStatus, // Spec 013: Health is source of truth
-		})
+		}
+
+		// Spec 039: Add security scan summary if available
+		if s.securityScanner != nil {
+			scanSummary := s.securityScanner.GetScanSummary(context.Background(), serverStatus.Name)
+			if scanSummary != nil {
+				serverMap["security_scan"] = scanSummary
+			}
+		}
+
+		// Spec 044: include structured diagnostic error + stable error code.
+		if serverStatus.Diagnostic != nil {
+			d := serverStatus.Diagnostic
+			diagMap := map[string]interface{}{
+				"code":        string(d.Code),
+				"severity":    string(d.Severity),
+				"cause":       d.Cause,
+				"detected_at": d.DetectedAt,
+			}
+			if entry, ok := diagnostics.Get(d.Code); ok {
+				diagMap["user_message"] = entry.UserMessage
+				diagMap["fix_steps"] = entry.FixSteps
+				diagMap["docs_url"] = entry.DocsURL
+			}
+			serverMap["diagnostic"] = diagMap
+			serverMap["error_code"] = string(d.Code)
+		}
+
+		result = append(result, serverMap)
 	}
 
 	s.logger.Debug("GetAllServers completed", zap.Int("server_count", len(result)))
@@ -1038,8 +1090,117 @@ func (s *Server) AddServer(ctx context.Context, serverConfig *config.ServerConfi
 	// Notify about upstream server change
 	s.OnUpstreamServerChange()
 
+	// If quarantined, grant inspection exemption so tools can be discovered and reviewed
+	if serverConfig.Quarantined {
+		if supervisor := s.runtime.Supervisor(); supervisor != nil {
+			// Grant 1 hour exemption for initial tool review
+			if err := supervisor.RequestInspectionExemption(serverConfig.Name, 1*time.Hour); err != nil {
+				s.logger.Warn("Failed to grant inspection exemption for new quarantined server",
+					zap.String("server", serverConfig.Name),
+					zap.Error(err))
+			} else {
+				s.logger.Info("Granted inspection exemption for new quarantined server — tools will be discoverable for review",
+					zap.String("server", serverConfig.Name))
+			}
+		}
+	}
+
 	s.logger.Info("Server added successfully",
 		zap.String("name", serverConfig.Name))
+
+	return nil
+}
+
+// UpdateServer applies partial updates to an existing upstream server configuration.
+func (s *Server) UpdateServer(ctx context.Context, serverName string, updates *config.ServerConfig) error {
+	s.logger.Info("Updating upstream server", zap.String("name", serverName))
+
+	storageManager := s.runtime.StorageManager()
+	existing, err := storageManager.GetUpstreamServer(serverName)
+	if err != nil || existing == nil {
+		return fmt.Errorf("server '%s' not found", serverName)
+	}
+
+	// Apply non-zero/non-nil fields from updates
+	if updates.URL != "" {
+		existing.URL = updates.URL
+	}
+	if updates.Command != "" {
+		existing.Command = updates.Command
+	}
+	if updates.Args != nil {
+		existing.Args = updates.Args
+	}
+	if updates.Env != nil {
+		existing.Env = updates.Env
+	}
+	if updates.Headers != nil {
+		existing.Headers = updates.Headers
+	}
+	if updates.WorkingDir != "" {
+		existing.WorkingDir = updates.WorkingDir
+	}
+	if updates.Protocol != "" {
+		existing.Protocol = updates.Protocol
+	}
+	// Booleans are always applied since the handler only calls UpdateServer
+	// when the caller explicitly provided these fields
+	existing.Enabled = updates.Enabled
+	existing.Quarantined = updates.Quarantined
+	existing.ReconnectOnUse = updates.ReconnectOnUse
+
+	// Isolation is PATCH-semantic: nil means "leave unchanged"; a
+	// present struct means "replace". Within the struct, the caller
+	// only populates fields they want to set (handled upstream by
+	// IsolationRequest.toConfig), so we merge into the existing
+	// override set rather than wholesale replacing.
+	if updates.Isolation != nil {
+		if existing.Isolation == nil {
+			existing.Isolation = &config.IsolationConfig{}
+		}
+		if updates.Isolation.Enabled != nil {
+			existing.Isolation.Enabled = updates.Isolation.Enabled
+		}
+		if updates.Isolation.Image != "" {
+			existing.Isolation.Image = updates.Isolation.Image
+		}
+		if updates.Isolation.NetworkMode != "" {
+			existing.Isolation.NetworkMode = updates.Isolation.NetworkMode
+		}
+		if updates.Isolation.ExtraArgs != nil {
+			existing.Isolation.ExtraArgs = updates.Isolation.ExtraArgs
+		}
+		if updates.Isolation.WorkingDir != "" {
+			existing.Isolation.WorkingDir = updates.Isolation.WorkingDir
+		}
+	}
+
+	// Save to storage
+	if err := storageManager.SaveUpstreamServer(existing); err != nil {
+		return fmt.Errorf("failed to save server: %w", err)
+	}
+
+	// Update runtime config
+	currentConfig := s.runtime.Config()
+	if currentConfig != nil {
+		for i, sc := range currentConfig.Servers {
+			if sc.Name == serverName {
+				currentConfig.Servers[i] = existing
+				break
+			}
+		}
+		s.runtime.UpdateConfig(currentConfig, "")
+	}
+
+	// Save configuration to file
+	if err := s.SaveConfiguration(); err != nil {
+		s.logger.Warn("Failed to save configuration after updating server", zap.Error(err))
+	}
+
+	// Notify about change
+	s.OnUpstreamServerChange()
+
+	s.logger.Info("Server updated successfully", zap.String("name", serverName))
 
 	return nil
 }
@@ -1536,6 +1697,45 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 			dataDir = cfg.DataDir
 		}
 		httpAPIServer.SetTokenStore(sm, dataDir)
+	}
+	// Wire feedback submitter (Spec 036)
+	if ts := s.runtime.TelemetryService(); ts != nil {
+		httpAPIServer.SetFeedbackSubmitter(ts)
+		// Spec 042: Tier 2 counter registry — surface and REST endpoint
+		// middlewares record into this.
+		httpAPIServer.SetTelemetryRegistry(ts.Registry())
+	}
+	// Spec 042: provide live telemetry service to /api/v1/telemetry/payload
+	// handler via a closure so `mcpproxy telemetry show-payload` can render
+	// the next heartbeat with runtime stats attached.
+	httpAPIServer.SetTelemetryPayloadProvider(func() *telemetry.Service {
+		return s.runtime.TelemetryService()
+	})
+	// Wire client connect service
+	if cfg := s.runtime.Config(); cfg != nil {
+		connectSvc := connect.NewService(cfg.Listen, cfg.APIKey)
+		httpAPIServer.SetConnectService(connectSvc)
+	}
+	// Wire security scanner service (Spec 039)
+	if sm := s.runtime.StorageManager(); sm != nil {
+		cfg := s.runtime.Config()
+		dataDir := ""
+		if cfg != nil {
+			dataDir = cfg.DataDir
+		}
+		secRegistry := scanner.NewRegistry(dataDir, s.logger)
+		secDocker := scanner.NewDockerRunner(s.logger)
+		secService := scanner.NewService(sm, secRegistry, secDocker, dataDir, s.logger)
+		if cfg != nil && cfg.Security != nil && cfg.Security.ScannerDisableNoNewPrivileges {
+			secService.SetScannerDisableNoNewPrivileges(true)
+		}
+		secService.SetEmitter(s.runtime)
+		secService.SetServerInfoProvider(&configServerInfoProvider{cfg: cfg, server: s})
+		secService.SetServerUnquarantiner(&serverUnquarantinerAdapter{server: s})
+		secService.SetSecretStore(&keyringSecretStore{resolver: secret.NewResolver()})
+		secService.CleanupStaleJobs()
+		httpAPIServer.SetSecurityController(secService)
+		s.securityScanner = secService
 	}
 	// Wire teams multi-user OAuth (no-op in personal edition)
 	wireTeamsOAuth(s, httpAPIServer)
@@ -2217,4 +2417,120 @@ func (s *Server) ApproveAllTools(serverName string, approvedBy string) (int, err
 // GetToolApproval returns the approval record for a specific tool (Spec 032).
 func (s *Server) GetToolApproval(serverName, toolName string) (*storage.ToolApprovalRecord, error) {
 	return s.runtime.GetToolApproval(serverName, toolName)
+}
+
+// GetToolApprovalStatus returns the approval status string for a specific tool.
+func (s *Server) GetToolApprovalStatus(serverName, toolName string) (string, error) {
+	record, err := s.runtime.GetToolApproval(serverName, toolName)
+	if err != nil {
+		return "", err
+	}
+	return string(record.Status), nil
+}
+
+// serverUnquarantinerAdapter adapts *Server to scanner.ServerUnquarantiner so
+// the security scanner service can unquarantine a server after ApproveServer
+// succeeds. Reuses the existing Server.UnquarantineServer path so the behavior
+// stays identical to the REST API and tray code.
+type serverUnquarantinerAdapter struct {
+	server *Server
+}
+
+func (a *serverUnquarantinerAdapter) UnquarantineServer(serverName string) error {
+	if a.server == nil {
+		return fmt.Errorf("server unavailable")
+	}
+	return a.server.UnquarantineServer(serverName)
+}
+
+// keyringSecretStore adapts secret.Resolver to scanner.SecretStore for API key management.
+type keyringSecretStore struct {
+	resolver *secret.Resolver
+}
+
+func (k *keyringSecretStore) StoreSecret(ctx context.Context, name, value string) error {
+	ref := secret.Ref{Type: "keyring", Name: name}
+	return k.resolver.Store(ctx, ref, value)
+}
+
+func (k *keyringSecretStore) ResolveSecret(ctx context.Context, refStr string) (string, error) {
+	ref, err := secret.ParseSecretRef(refStr)
+	if err != nil {
+		return "", err
+	}
+	return k.resolver.Resolve(ctx, *ref)
+}
+
+// configServerInfoProvider implements scanner.ServerInfoProvider using the config and server.
+type configServerInfoProvider struct {
+	cfg    *config.Config
+	server *Server
+}
+
+func (p *configServerInfoProvider) GetServerInfo(serverName string) (*scanner.ServerInfo, error) {
+	if p.cfg == nil {
+		return nil, fmt.Errorf("no config available")
+	}
+	for _, sc := range p.cfg.Servers {
+		if sc.Name == serverName {
+			return &scanner.ServerInfo{
+				Name:       sc.Name,
+				Protocol:   sc.Protocol,
+				Command:    sc.Command,
+				Args:       sc.Args,
+				WorkingDir: sc.WorkingDir,
+				URL:        sc.URL,
+				Env:        sc.Env,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("server %q not found in config", serverName)
+}
+
+func (p *configServerInfoProvider) GetServerTools(serverName string) ([]map[string]interface{}, error) {
+	if p.server != nil {
+		return p.server.GetServerTools(serverName)
+	}
+	return nil, fmt.Errorf("server tools not available")
+}
+
+// EnsureConnected attempts to connect a disconnected server so tool definitions
+// can be retrieved for security scanning. For quarantined servers, grants a
+// temporary inspection exemption so the supervisor allows the connection.
+func (p *configServerInfoProvider) EnsureConnected(ctx context.Context, serverName string) error {
+	if p.server == nil {
+		return fmt.Errorf("server instance not available")
+	}
+
+	// For quarantined servers, grant inspection exemption before restart.
+	// Without this, the supervisor refuses to connect quarantined servers.
+	supervisor := p.server.runtime.Supervisor()
+	if supervisor != nil {
+		snapshot := supervisor.StateView().Snapshot()
+		if ss, exists := snapshot.Servers[serverName]; exists && ss.Quarantined {
+			if err := supervisor.RequestInspectionExemption(serverName, 15*time.Minute); err != nil {
+				p.server.logger.Warn("Failed to grant inspection exemption for scan",
+					zap.String("server", serverName), zap.Error(err))
+			}
+		}
+	}
+
+	return p.server.runtime.RestartServer(serverName)
+}
+
+// IsConnected checks if the server has an active MCP connection via the stateview.
+func (p *configServerInfoProvider) IsConnected(serverName string) bool {
+	if p.server == nil {
+		return false
+	}
+	supervisor := p.server.runtime.Supervisor()
+	if supervisor == nil {
+		return false
+	}
+	snapshot := supervisor.StateView().Snapshot()
+	serverStatus, exists := snapshot.Servers[serverName]
+	if !exists {
+		return false
+	}
+	return serverStatus.Connected
 }

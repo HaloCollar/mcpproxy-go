@@ -2,18 +2,19 @@
   <div id="app" class="drawer lg:drawer-open">
     <input id="sidebar-drawer" type="checkbox" class="drawer-toggle" />
 
-    <!-- Main content area -->
-    <div class="drawer-content grid grid-rows-[auto_1fr] h-screen bg-base-200 lg:pl-64">
+    <!-- Main content area. The left padding is bound to sidebar collapsed
+         state so the content fluidly reclaims space when the sidebar shrinks
+         to its icon rail. -->
+    <div
+      class="drawer-content grid grid-rows-[auto_1fr] h-screen bg-base-200 transition-[padding] duration-200 ease-out"
+      :class="systemStore.sidebarCollapsed ? 'lg:pl-14' : 'lg:pl-64'"
+    >
       <!-- Top Header -->
       <TopHeader />
 
       <!-- Page content -->
       <main class="overflow-y-auto p-6">
-        <router-view v-slot="{ Component }">
-          <transition name="page" mode="out-in">
-            <component :is="Component" />
-          </transition>
-        </router-view>
+        <router-view />
       </main>
     </div>
 
@@ -125,20 +126,4 @@ onUnmounted(() => {
 })
 </script>
 
-<style scoped>
-/* Page transitions */
-.page-enter-active,
-.page-leave-active {
-  transition: all 0.3s ease;
-}
-
-.page-enter-from {
-  opacity: 0;
-  transform: translateX(10px);
-}
-
-.page-leave-to {
-  opacity: 0;
-  transform: translateX(-10px);
-}
-</style>
+<!-- Page transitions removed: caused CSS transition deadlock blocking SPA navigation (QA 2026-03-29) -->

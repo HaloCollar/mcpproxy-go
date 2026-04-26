@@ -56,6 +56,42 @@
         </div>
       </div>
 
+      <!-- Security scan badge (Spec 039)
+           Wrapped in a DaisyUI tooltip that explains the state and carries a
+           disclaimer that the risk score is an experimental heuristic. -->
+      <div v-if="server.security_scan" class="flex items-center gap-2 mb-4">
+        <div
+          class="flex items-center gap-1.5 text-sm tooltip tooltip-right tooltip-bottom max-w-xs"
+          :data-tip="securityBadgeTooltip"
+        >
+          <!-- Shield icon -->
+          <svg
+            class="w-4 h-4 flex-shrink-0"
+            :class="securityBadgeColor"
+            fill="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path d="M12 2L3.5 6.5V11c0 5.55 3.84 10.74 8.5 12 4.66-1.26 8.5-6.45 8.5-12V6.5L12 2zm0 2.18l6.5 3.35V11c0 4.52-3.15 8.76-6.5 9.93C8.65 19.76 5.5 15.52 5.5 11V7.53L12 4.18z"/>
+            <path v-if="securityScanStatus === 'clean'" d="M10 15.5l-3.5-3.5 1.41-1.41L10 12.67l5.59-5.59L17 8.5l-7 7z"/>
+            <path v-else-if="securityScanStatus === 'dangerous'" d="M12 8v4m0 4h.01" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+          </svg>
+          <span
+            v-if="securityScanStatus === 'scanning'"
+            class="flex items-center gap-1 text-xs text-base-content/60"
+          >
+            <span class="loading loading-spinner loading-xs"></span>
+            Scanning...
+          </span>
+          <span
+            v-else
+            class="text-xs"
+            :class="securityBadgeColor"
+          >
+            {{ securityBadgeText }}
+          </span>
+        </div>
+      </div>
+
       <!-- Error message - suppressed when health.action conveys the issue (FR-018, FR-019) -->
       <div v-if="shouldShowError" class="alert alert-error alert-sm mb-4">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -77,7 +113,7 @@
         <!-- Primary action button based on health.action -->
         <button
           v-if="healthAction === 'approve'"
-          @click="unquarantine"
+          @click="handleApproveClick"
           :disabled="loading"
           class="btn btn-sm btn-warning"
         >
@@ -150,6 +186,35 @@
           Logout
         </button>
 
+        <template v-if="hasEnabledScanners()">
+          <div
+            v-if="!server.enabled"
+            class="tooltip tooltip-top"
+            data-tip="Enable server first"
+          >
+            <button
+              class="btn btn-sm btn-outline btn-ghost"
+              disabled
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+              </svg>
+              Scan
+            </button>
+          </div>
+          <router-link
+            v-else
+            :to="`/servers/${server.name}?tab=security`"
+            class="btn btn-sm btn-outline btn-ghost"
+            title="Security Scan"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+            </svg>
+            Scan
+          </router-link>
+        </template>
+
         <router-link
           :to="`/servers/${server.name}`"
           class="btn btn-sm btn-outline"
@@ -164,6 +229,51 @@
         >
           Delete
         </button>
+      </div>
+    </div>
+
+    <!-- Approve Confirmation Modal (F-04: security scanner gated) -->
+    <div v-if="showApproveConfirmation" class="modal modal-open">
+      <div class="modal-box">
+        <h3 class="font-bold text-lg mb-4">
+          {{ approveDialogMode === 'no_scan' ? 'No Security Scan Run' : 'Critical Findings Detected' }}
+        </h3>
+        <p v-if="approveDialogMode === 'critical'" class="mb-4">
+          <strong>{{ server.name }}</strong> has
+          <span class="text-error font-semibold">{{ criticalFindingCount }} critical finding{{ criticalFindingCount === 1 ? '' : 's' }}</span>
+          in its most recent security scan. Approving this server will allow it to run despite these warnings.
+        </p>
+        <p v-else class="mb-4">
+          No security scan has been run for <strong>{{ server.name }}</strong>. We strongly recommend running a scan first.
+        </p>
+        <p class="text-sm text-base-content/70 mb-6">
+          The security scanner is an experimental heuristic. Force-approving a server bypasses the scanner gate and is irreversible from this dialog.
+        </p>
+        <div class="modal-action">
+          <button
+            @click="showApproveConfirmation = false"
+            :disabled="loading"
+            class="btn btn-outline"
+          >
+            Cancel
+          </button>
+          <router-link
+            v-if="approveDialogMode === 'no_scan'"
+            :to="`/servers/${server.name}?tab=security`"
+            class="btn btn-primary"
+            @click="showApproveConfirmation = false"
+          >
+            Scan First
+          </router-link>
+          <button
+            @click="confirmForceApprove"
+            :disabled="loading"
+            class="btn btn-error"
+          >
+            <span v-if="loading" class="loading loading-spinner loading-xs"></span>
+            Force Approve
+          </button>
+        </div>
       </div>
     </div>
 
@@ -204,6 +314,7 @@ import { ref, computed } from 'vue'
 import type { Server } from '@/types'
 import { useServersStore } from '@/stores/servers'
 import { useSystemStore } from '@/stores/system'
+import { useSecurityScannerStatus } from '@/composables/useSecurityScannerStatus'
 
 interface Props {
   server: Server
@@ -213,8 +324,11 @@ const props = defineProps<Props>()
 
 const serversStore = useServersStore()
 const systemStore = useSystemStore()
+const { hasEnabledScanners } = useSecurityScannerStatus()
 const loading = ref(false)
 const showDeleteConfirmation = ref(false)
+const showApproveConfirmation = ref(false)
+const approveDialogMode = ref<'no_scan' | 'critical'>('no_scan')
 
 const isHttpProtocol = computed(() => {
   return props.server.protocol === 'http' || props.server.protocol === 'streamable-http'
@@ -280,6 +394,67 @@ const quarantineToolCount = computed(() => {
   const q = props.server.quarantine
   if (!q) return 0
   return (q.pending_count ?? 0) + (q.changed_count ?? 0)
+})
+
+// Security scan badge (Spec 039)
+const securityScanStatus = computed(() => {
+  return props.server.security_scan?.status || 'not_scanned'
+})
+
+const securityBadgeColor = computed(() => {
+  switch (securityScanStatus.value) {
+    case 'clean': return 'text-success'
+    case 'warnings': return 'text-warning'
+    case 'dangerous': return 'text-error'
+    case 'failed': return 'text-error'
+    default: return 'text-base-content/40'
+  }
+})
+
+const securityBadgeText = computed(() => {
+  const scan = props.server.security_scan
+  if (!scan) return 'Not scanned'
+  switch (scan.status) {
+    case 'clean': return 'Clean'
+    case 'warnings': {
+      const count = scan.finding_counts?.warning ?? 0
+      return `${count} warning${count !== 1 ? 's' : ''}`
+    }
+    case 'dangerous': return 'Dangerous'
+    case 'failed': return 'Scan Failed'
+    case 'not_scanned': return 'Not scanned'
+    case 'scanning': return 'Scanning...'
+    default: return scan.status
+  }
+})
+
+// Hover explanation for the security badge. Every state carries the
+// experimental-heuristic disclaimer so users don't over-trust the label.
+const securityBadgeTooltip = computed(() => {
+  const scan = props.server.security_scan
+  if (!scan) return ''
+  const disclaimer =
+    'Experimental heuristic — verify findings manually; results may not be precise.'
+  switch (scan.status) {
+    case 'clean':
+      return `Clean: no findings above the warning threshold in the most recent scan. ${disclaimer}`
+    case 'warnings': {
+      const count = scan.finding_counts?.warning ?? 0
+      return `${count} warning${count !== 1 ? 's' : ''} found — review the Security tab for details. ${disclaimer}`
+    }
+    case 'dangerous': {
+      const dangerous = scan.finding_counts?.dangerous ?? 0
+      return `${dangerous} dangerous finding${dangerous !== 1 ? 's' : ''} detected. Review before approving. ${disclaimer}`
+    }
+    case 'failed':
+      return `The last scan failed to produce a verdict. Re-run from the Security tab. ${disclaimer}`
+    case 'not_scanned':
+      return 'This server has not been scanned yet.'
+    case 'scanning':
+      return 'Security scan in progress…'
+    default:
+      return disclaimer
+  }
 })
 
 // Determine if error message should be shown (FR-018, FR-019)
@@ -457,24 +632,65 @@ async function triggerLogout() {
   }
 }
 
-async function unquarantine() {
+// Counts critical findings from the scan summary if available. Used to gate
+// the Approve button behind an extra confirmation (F-04).
+const criticalFindingCount = computed(() => {
+  const scan = props.server.security_scan as any
+  if (!scan) return 0
+  // finding_counts.critical is populated from the latest report summary.
+  const fc = scan.finding_counts as Record<string, number> | undefined
+  if (fc && typeof fc.critical === 'number') return fc.critical
+  return 0
+})
+
+// True when a scan has actually been run (has a last_scan_at timestamp).
+const hasCompletedScan = computed(() => {
+  const scan = props.server.security_scan
+  if (!scan) return false
+  return !!scan.last_scan_at
+})
+
+// Primary approve click handler. Chooses the right flow based on scan state:
+//   1. No scan run yet → open "Scan first / Force approve" dialog
+//   2. Scan run with critical findings → open "Force approve?" dialog
+//   3. Clean scan → call securityApproveServer directly
+function handleApproveClick() {
+  if (!hasCompletedScan.value) {
+    approveDialogMode.value = 'no_scan'
+    showApproveConfirmation.value = true
+    return
+  }
+  if (criticalFindingCount.value > 0) {
+    approveDialogMode.value = 'critical'
+    showApproveConfirmation.value = true
+    return
+  }
+  void doSecurityApprove(false)
+}
+
+async function doSecurityApprove(force: boolean) {
   loading.value = true
   try {
-    await serversStore.unquarantineServer(props.server.name)
+    await serversStore.securityApproveServer(props.server.name, force)
     systemStore.addToast({
       type: 'success',
-      title: 'Server Unquarantined',
-      message: `${props.server.name} has been removed from quarantine`,
+      title: 'Server Approved',
+      message: `${props.server.name} has been approved and unquarantined`,
     })
+    showApproveConfirmation.value = false
   } catch (error) {
     systemStore.addToast({
       type: 'error',
-      title: 'Unquarantine Failed',
+      title: 'Approve Failed',
       message: error instanceof Error ? error.message : 'Unknown error',
     })
   } finally {
     loading.value = false
   }
+}
+
+function confirmForceApprove() {
+  void doSecurityApprove(true)
 }
 
 async function confirmDelete() {

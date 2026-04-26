@@ -1,4 +1,4 @@
-import type { APIResponse, Server, Tool, ToolApproval, SearchResult, StatusUpdate, SecretRef, MigrationAnalysis, ConfigSecretsResponse, GetToolCallsResponse, GetToolCallDetailResponse, GetServerToolCallsResponse, GetConfigResponse, ValidateConfigResponse, ConfigApplyResult, ServerTokenMetrics, GetRegistriesResponse, SearchRegistryServersResponse, RepositoryServer, GetSessionsResponse, GetSessionDetailResponse, InfoResponse, ActivityListResponse, ActivityDetailResponse, ActivitySummaryResponse, ImportResponse, AgentTokenInfo, CreateAgentTokenRequest, CreateAgentTokenResponse, RoutingInfo } from '@/types'
+import type { APIResponse, Server, Tool, ToolApproval, SearchResult, StatusUpdate, SecretRef, MigrationAnalysis, ConfigSecretsResponse, GetToolCallsResponse, GetToolCallDetailResponse, GetServerToolCallsResponse, GetConfigResponse, ValidateConfigResponse, ConfigApplyResult, ServerTokenMetrics, GetRegistriesResponse, SearchRegistryServersResponse, RepositoryServer, GetSessionsResponse, GetSessionDetailResponse, InfoResponse, ActivityListResponse, ActivityDetailResponse, ActivitySummaryResponse, ImportResponse, AgentTokenInfo, CreateAgentTokenRequest, CreateAgentTokenResponse, RoutingInfo, ConnectStatusResponse, ConnectResult, DiagnosticFixResponse } from '@/types'
 
 // Event types for API service
 export interface APIAuthEvent {
@@ -139,6 +139,12 @@ class APIService {
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
+        // Spec 042: telemetry surface header so the daemon can attribute
+        // requests to the web UI for the surface_requests counter. Version
+        // is intentionally a constant string — the daemon already reports
+        // its own build version separately and we don't want to leak the
+        // browser/UA fingerprint into telemetry.
+        'X-MCPProxy-Client': 'webui/web',
       }
 
       // Merge headers from options if they exist
@@ -361,6 +367,19 @@ class APIService {
     })
   }
 
+  // Docker status
+  async getDockerStatus(): Promise<APIResponse<{
+    docker_available: boolean
+    recovery_mode: boolean
+    failure_count: number
+    attempts_since_up: number
+    last_attempt: string
+    last_error: string
+    last_successful_at: string
+  }>> {
+    return this.request('/api/v1/docker/status')
+  }
+
   // Diagnostics
   async getDiagnostics(): Promise<APIResponse<{
     upstream_errors: Array<{
@@ -394,6 +413,33 @@ class APIService {
     last_updated: string
   }>> {
     return this.request('/api/v1/diagnostics')
+  }
+
+  // Spec 044 — per-server diagnostics.
+  async getServerDiagnostic(serverName: string): Promise<APIResponse<{
+    server: string
+    connected: boolean
+    status: string
+    health: any
+    diagnostic: any | null
+    error_code: string | null
+    catalog_size: number
+  }>> {
+    return this.request(`/api/v1/servers/${encodeURIComponent(serverName)}/diagnostics`)
+  }
+
+  // Spec 044 — invoke a registered fixer. Destructive fixers default to
+  // dry_run unless mode='execute' is supplied by the caller.
+  async invokeDiagnosticFix(params: {
+    server: string
+    code: string
+    fixer_key: string
+    mode?: 'dry_run' | 'execute'
+  }): Promise<APIResponse<DiagnosticFixResponse>> {
+    return this.request<DiagnosticFixResponse>('/api/v1/diagnostics/fix', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
   }
 
   // Tool Call History endpoints
@@ -448,6 +494,16 @@ class APIService {
     return this.request<ConfigApplyResult>('/api/v1/config/apply', {
       method: 'POST',
       body: JSON.stringify(config)
+    })
+  }
+
+  // setDockerIsolationEnabled flips the global docker_isolation.enabled
+  // flag without resending the full config. Mirrors the PATCH endpoint
+  // added on the backend.
+  async setDockerIsolationEnabled(enabled: boolean): Promise<APIResponse<ConfigApplyResult>> {
+    return this.request<ConfigApplyResult>('/api/v1/config/docker-isolation', {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled })
     })
   }
 
@@ -518,8 +574,9 @@ class APIService {
   }
 
   // Info endpoint (version and update information)
-  async getInfo(): Promise<APIResponse<InfoResponse>> {
-    return this.request<InfoResponse>('/api/v1/info')
+  async getInfo(opts?: { refresh?: boolean }): Promise<APIResponse<InfoResponse>> {
+    const url = opts?.refresh ? '/api/v1/info?refresh=true' : '/api/v1/info'
+    return this.request<InfoResponse>(url)
   }
 
   // Activity Log endpoints (RFC-003)
@@ -726,6 +783,138 @@ class APIService {
       method: 'POST',
       credentials: 'include',
     } as RequestInit)
+  }
+
+  // Feedback submission
+  async submitFeedback(data: { category: string; message: string; email?: string }): Promise<APIResponse<{ issue_url?: string }>> {
+    return this.request<{ issue_url?: string }>('/api/v1/feedback', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+  }
+
+  // Connect feature (client registration)
+  async getConnectStatus(): Promise<APIResponse<ConnectStatusResponse>> {
+    return this.request<ConnectStatusResponse>('/api/v1/connect')
+  }
+
+  async connectClient(clientId: string, serverName = 'mcpproxy', force = false): Promise<APIResponse<ConnectResult>> {
+    return this.request<ConnectResult>(`/api/v1/connect/${encodeURIComponent(clientId)}`, {
+      method: 'POST',
+      body: JSON.stringify({ server_name: serverName, force })
+    })
+  }
+
+  async disconnectClient(clientId: string): Promise<APIResponse<ConnectResult>> {
+    return this.request<ConnectResult>(`/api/v1/connect/${encodeURIComponent(clientId)}`, {
+      method: 'DELETE',
+    })
+  }
+
+  // Security Scanner Management (Spec 039)
+  async listScanners(): Promise<APIResponse<any[]>> {
+    return this.request<any[]>('/api/v1/security/scanners')
+  }
+
+  async installScanner(id: string): Promise<APIResponse<void>> {
+    return this.request<void>(`/api/v1/security/scanners/${encodeURIComponent(id)}/enable`, {
+      method: 'POST',
+    })
+  }
+
+  async removeScanner(id: string): Promise<APIResponse<void>> {
+    return this.request<void>(`/api/v1/security/scanners/${encodeURIComponent(id)}/disable`, {
+      method: 'POST',
+    })
+  }
+
+  async configureScanner(id: string, env: Record<string, string>, dockerImage?: string): Promise<APIResponse<void>> {
+    const payload: any = { env }
+    if (dockerImage) payload.docker_image = dockerImage
+    return this.request<void>(`/api/v1/security/scanners/${encodeURIComponent(id)}/config`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+  }
+
+  async getScannerStatus(id: string): Promise<APIResponse<any>> {
+    return this.request<any>(`/api/v1/security/scanners/${encodeURIComponent(id)}/status`)
+  }
+
+  async startScan(serverName: string, dryRun = false, scannerIds: string[] = []): Promise<APIResponse<any>> {
+    return this.request<any>(`/api/v1/servers/${encodeURIComponent(serverName)}/scan`, {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: dryRun, scanner_ids: scannerIds }),
+    })
+  }
+
+  async getScanStatus(serverName: string): Promise<APIResponse<any>> {
+    return this.request<any>(`/api/v1/servers/${encodeURIComponent(serverName)}/scan/status`)
+  }
+
+  async getScanReport(serverName: string): Promise<APIResponse<any>> {
+    return this.request<any>(`/api/v1/servers/${encodeURIComponent(serverName)}/scan/report`)
+  }
+
+  async getScanFiles(serverName: string, limit = 100, offset = 0, pass = 1): Promise<APIResponse<any>> {
+    return this.request<any>(`/api/v1/servers/${encodeURIComponent(serverName)}/scan/files?limit=${limit}&offset=${offset}&pass=${pass}`)
+  }
+
+  async cancelScan(serverName: string): Promise<APIResponse<void>> {
+    return this.request<void>(`/api/v1/servers/${encodeURIComponent(serverName)}/scan/cancel`, {
+      method: 'POST',
+    })
+  }
+
+  async securityApprove(serverName: string, force = false): Promise<APIResponse<void>> {
+    return this.request<void>(`/api/v1/servers/${encodeURIComponent(serverName)}/security/approve`, {
+      method: 'POST',
+      body: JSON.stringify({ force }),
+    })
+  }
+
+  async securityReject(serverName: string): Promise<APIResponse<void>> {
+    return this.request<void>(`/api/v1/servers/${encodeURIComponent(serverName)}/security/reject`, {
+      method: 'POST',
+    })
+  }
+
+  async checkIntegrity(serverName: string): Promise<APIResponse<any>> {
+    return this.request<any>(`/api/v1/servers/${encodeURIComponent(serverName)}/integrity`)
+  }
+
+  async getSecurityOverview(): Promise<APIResponse<any>> {
+    return this.request<any>('/api/v1/security/overview')
+  }
+
+  async scanAll(scannerIds: string[] = []): Promise<APIResponse<any>> {
+    return this.request<any>('/api/v1/security/scan-all', {
+      method: 'POST',
+      body: JSON.stringify({ scanner_ids: scannerIds }),
+    })
+  }
+
+  async getQueueProgress(): Promise<APIResponse<any>> {
+    return this.request<any>('/api/v1/security/queue')
+  }
+
+  async cancelAllScans(): Promise<APIResponse<void>> {
+    return this.request<void>('/api/v1/security/cancel-all', { method: 'POST' })
+  }
+
+  async listScanHistory(params?: { sort?: string; order?: string; limit?: number; offset?: number; status?: string }): Promise<APIResponse<{ scans: any[]; total: number }>> {
+    const q = new URLSearchParams()
+    if (params?.sort) q.set('sort', params.sort)
+    if (params?.order) q.set('order', params.order)
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.offset) q.set('offset', String(params.offset))
+    if (params?.status) q.set('status', params.status)
+    const qs = q.toString()
+    return this.request<{ scans: any[]; total: number }>(`/api/v1/security/scans${qs ? '?' + qs : ''}`)
+  }
+
+  async getScanReportByJobId(jobId: string): Promise<APIResponse<any>> {
+    return this.request<any>(`/api/v1/security/scans/${encodeURIComponent(jobId)}/report`)
   }
 
   // Utility methods

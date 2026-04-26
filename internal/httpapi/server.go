@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/auth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/connect"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/management"
@@ -24,6 +27,7 @@ import (
 	internalRuntime "github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
@@ -55,7 +59,9 @@ type ServerController interface {
 	GetAllServers() ([]map[string]interface{}, error)
 	AddServer(ctx context.Context, serverConfig *config.ServerConfig) error // T001: Add server
 	RemoveServer(ctx context.Context, serverName string) error              // T002: Remove server
+	UpdateServer(ctx context.Context, serverName string, updates *config.ServerConfig) error
 	EnableServer(serverName string, enabled bool) error
+	GetToolApprovalStatus(serverName, toolName string) (string, error)
 	RestartServer(serverName string) error
 	ForceReconnectAllServers(reason string) error
 	GetDockerRecoveryStatus() *storage.DockerRecoveryState
@@ -127,13 +133,41 @@ type ServerController interface {
 
 // Server provides HTTP API endpoints with chi router
 type Server struct {
-	controller    ServerController
-	logger        *zap.SugaredLogger
-	httpLogger    *zap.Logger // Separate logger for HTTP requests
-	router        *chi.Mux
-	observability *observability.Manager
-	tokenStore    TokenStore // Agent token CRUD (T022)
-	dataDir       string     // Data directory for HMAC key (T022)
+	controller         ServerController
+	logger             *zap.SugaredLogger
+	httpLogger         *zap.Logger // Separate logger for HTTP requests
+	router             *chi.Mux
+	observability      *observability.Manager
+	tokenStore         TokenStore         // Agent token CRUD (T022)
+	dataDir            string             // Data directory for HMAC key (T022)
+	feedbackSubmitter  FeedbackSubmitter  // Feedback submission (Spec 036)
+	connectService     *connect.Service   // Client connect/disconnect operations
+	securityController SecurityController // Security scanner operations (Spec 039)
+
+	// telemetryRegistry is the Tier 2 counter aggregator (Spec 042). May be
+	// nil before SetTelemetryRegistry is called; middlewares use the nil-safe
+	// telemetry helpers so the call sites do not need to nil-check.
+	telemetryRegistry *telemetry.CounterRegistry
+
+	// telemetryPayloadProvider returns the live telemetry.Service so the
+	// /api/v1/telemetry/payload endpoint can render the next heartbeat payload
+	// with runtime stats attached. May be nil before SetTelemetryPayloadProvider
+	// is called.
+	telemetryPayloadProvider func() *telemetry.Service
+}
+
+// SetTelemetryRegistry attaches the Tier 2 counter registry. Spec 042. Must
+// be called before the router serves requests for the surface and REST
+// endpoint counters to populate.
+func (s *Server) SetTelemetryRegistry(reg *telemetry.CounterRegistry) {
+	s.telemetryRegistry = reg
+}
+
+// SetTelemetryPayloadProvider attaches a provider that returns the live
+// telemetry service. Used by the /api/v1/telemetry/payload endpoint to render
+// the next heartbeat payload with runtime stats. Spec 042.
+func (s *Server) SetTelemetryPayloadProvider(fn func() *telemetry.Service) {
+	s.telemetryPayloadProvider = fn
 }
 
 // NewServer creates a new HTTP API server
@@ -163,6 +197,16 @@ func NewServer(controller ServerController, logger *zap.SugaredLogger, obs *obse
 func (s *Server) SetTokenStore(store TokenStore, dataDir string) {
 	s.tokenStore = store
 	s.dataDir = dataDir
+}
+
+// SetFeedbackSubmitter configures the feedback submission handler (Spec 036).
+func (s *Server) SetFeedbackSubmitter(submitter FeedbackSubmitter) {
+	s.feedbackSubmitter = submitter
+}
+
+// SetConnectService configures the client connect/disconnect service.
+func (s *Server) SetConnectService(svc *connect.Service) {
+	s.connectService = svc
 }
 
 // Router returns the underlying chi.Mux for external route registration.
@@ -440,6 +484,10 @@ func (s *Server) setupRoutes() {
 		// Apply timeout and API key authentication middleware to API routes only
 		r.Use(middleware.Timeout(60 * time.Second))
 		r.Use(s.apiKeyAuthMiddleware())
+		// Spec 042: Tier 2 telemetry middlewares. Both fetch the registry via
+		// a closure so the registry can be installed after route setup.
+		r.Use(SurfaceClassifierMiddleware(func() *telemetry.CounterRegistry { return s.telemetryRegistry }))
+		r.Use(RESTEndpointHistogramMiddleware(func() *telemetry.CounterRegistry { return s.telemetryRegistry }))
 
 		// Status endpoint
 		r.Get("/status", s.handleGetStatus)
@@ -463,6 +511,7 @@ func (s *Server) setupRoutes() {
 		r.Post("/servers/enable_all", s.handleEnableAll)
 		r.Post("/servers/disable_all", s.handleDisableAll)
 		r.Route("/servers/{id}", func(r chi.Router) {
+			r.Patch("/", s.handlePatchServer)   // Partial update server config
 			r.Delete("/", s.handleRemoveServer) // T002: Remove server
 			r.Post("/enable", s.handleEnableServer)
 			r.Post("/disable", s.handleDisableServer)
@@ -474,12 +523,24 @@ func (s *Server) setupRoutes() {
 			r.Post("/discover-tools", s.handleDiscoverServerTools)
 			r.Get("/tools", s.handleGetServerTools)
 			r.Get("/logs", s.handleGetServerLogs)
+			// Spec 044: per-server diagnostics with stable error_code.
+			r.Get("/diagnostics", s.handleGetServerDiagnostics)
 			r.Get("/tool-calls", s.handleGetServerToolCalls)
 
 			// Tool-level quarantine (Spec 032)
 			r.Post("/tools/approve", s.handleApproveTools)
 			r.Get("/tools/{tool}/diff", s.handleGetToolDiff)
 			r.Get("/tools/export", s.handleExportToolDescriptions)
+
+			// Security scanner scan/approval routes (Spec 039)
+			r.Post("/scan", s.handleStartScan)
+			r.Get("/scan/status", s.handleGetScanStatus)
+			r.Get("/scan/report", s.handleGetScanReport)
+			r.Post("/scan/cancel", s.handleCancelScan)
+			r.Get("/scan/files", s.handleGetScanFiles)
+			r.Post("/security/approve", s.handleSecurityApprove)
+			r.Post("/security/reject", s.handleSecurityReject)
+			r.Get("/integrity", s.handleCheckIntegrity)
 		})
 
 		// Search
@@ -500,6 +561,12 @@ func (s *Server) setupRoutes() {
 		// Diagnostics
 		r.Get("/diagnostics", s.handleGetDiagnostics)
 		r.Get("/doctor", s.handleGetDiagnostics) // Alias for consistency with CLI command
+		// Spec 044: per-server diagnostics + fix invocation.
+		r.Post("/diagnostics/fix", s.handleInvokeFix)
+
+		// Telemetry payload preview (Spec 042) — renders the next heartbeat
+		// payload with runtime stats attached. No network call is made.
+		r.Get("/telemetry/payload", s.handleGetTelemetryPayload)
 
 		// Token statistics
 		r.Get("/stats/tokens", s.handleGetTokenStats)
@@ -523,6 +590,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/config", s.handleGetConfig)
 		r.Post("/config/validate", s.handleValidateConfig)
 		r.Post("/config/apply", s.handleApplyConfig)
+		r.Patch("/config/docker-isolation", s.handlePatchDockerIsolation)
 
 		// Registry browsing (Phase 7)
 		r.Get("/registries", s.handleListRegistries)
@@ -534,6 +602,9 @@ func (s *Server) setupRoutes() {
 		r.Get("/activity/export", s.handleExportActivity)
 		r.Get("/activity/{id}", s.handleGetActivityDetail)
 
+		// Annotation coverage (Spec 035)
+		r.Get("/annotations/coverage", s.handleAnnotationCoverage)
+
 		// Agent token management (Spec 028)
 		r.Route("/tokens", func(r chi.Router) {
 			r.Post("/", s.handleCreateToken)
@@ -543,6 +614,37 @@ func (s *Server) setupRoutes() {
 				r.Delete("/", s.handleRevokeToken)
 				r.Post("/regenerate", s.handleRegenerateToken)
 			})
+		})
+
+		// Feedback submission (Spec 036)
+		r.Post("/feedback", s.handleFeedback)
+
+		// Client connect/disconnect
+		r.Get("/connect", s.handleGetConnectStatus)
+		r.Post("/connect/{client}", s.handleConnectClient)
+		r.Delete("/connect/{client}", s.handleDisconnectClient)
+
+		// Security scanner management routes (Spec 039)
+		r.Route("/security", func(r chi.Router) {
+			r.Get("/scanners", s.handleListScanners)
+			r.Post("/scanners/{id}/enable", s.handleInstallScanner)
+			r.Post("/scanners/{id}/disable", s.handleRemoveScanner)
+			r.Put("/scanners/{id}/config", s.handleConfigureScanner)
+			r.Get("/scanners/{id}/status", s.handleGetScannerStatus)
+			r.Get("/overview", s.handleSecurityOverview)
+
+			// Legacy routes (backwards compatibility)
+			r.Post("/scanners/install", s.handleInstallScanner)
+			r.Delete("/scanners/{id}", s.handleRemoveScanner)
+
+			// Batch scan operations
+			r.Post("/scan-all", s.handleScanAll)
+			r.Get("/queue", s.handleGetQueueProgress)
+			r.Post("/cancel-all", s.handleCancelAllScans)
+
+			// Scan history
+			r.Get("/scans", s.handleListScanHistory)
+			r.Get("/scans/{jobId}/report", s.handleGetScanReportByJobID)
 		})
 	})
 
@@ -691,6 +793,36 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, _ *http.Request) {
 		"routing_mode":   routingMode,
 		"timestamp":      time.Now().Unix(),
 	}
+
+	// Spec 044 (FR-018): expose process-level env_kind + env_markers so the
+	// tray and CLI can surface the classifier verdict without waiting for the
+	// next heartbeat. DetectEnvKindOnce is cached, so repeated calls are free.
+	envKind, envMarkers := telemetry.DetectEnvKindOnce()
+	response["env_kind"] = string(envKind)
+	response["env_markers"] = envMarkers
+
+	// Spec 044 (T041): expose the activation funnel snapshot alongside
+	// env_kind. Read-only — mutation happens on MCP/connect events, never
+	// through this endpoint. nil when the telemetry service (or activation
+	// store) is not wired (e.g. very early startup).
+	if s.telemetryPayloadProvider != nil {
+		if svc := s.telemetryPayloadProvider(); svc != nil {
+			if store := svc.ActivationStore(); store != nil {
+				if db := svc.ActivationDB(); db != nil {
+					if st, err := store.Load(db); err == nil {
+						response["activation"] = st
+					}
+				}
+			}
+		}
+	}
+
+	// Spec 044 (US3): expose launch_source + autostart_enabled. launch_source
+	// is the cached classifier result (no installer-clearing side-effect here
+	// — this endpoint is read-only). autostart_enabled reads the tray-owned
+	// sidecar with its 1h TTL; nil on Linux / tray not running / malformed.
+	response["launch_source"] = string(telemetry.DetectLaunchSourceOnce())
+	response["autostart_enabled"] = telemetry.DefaultAutostartReader().Read()
 
 	s.writeSuccess(w, response)
 }
@@ -888,6 +1020,27 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 		// Enrich with quarantine stats
 		s.enrichServersWithQuarantineStats(serverValues)
 
+		// Enrich with security scan summary (Spec 039)
+		if s.securityController != nil {
+			for i := range serverValues {
+				if summary := s.securityController.GetScanSummary(r.Context(), serverValues[i].Name); summary != nil {
+					serverValues[i].SecurityScan = &contracts.SecurityScanSummary{
+						LastScanAt: summary.LastScanAt,
+						RiskScore:  summary.RiskScore,
+						Status:     summary.Status,
+					}
+					if summary.FindingCounts != nil {
+						serverValues[i].SecurityScan.FindingCounts = &contracts.FindingCounts{
+							Dangerous: summary.FindingCounts.Dangerous,
+							Warning:   summary.FindingCounts.Warning,
+							Info:      summary.FindingCounts.Info,
+							Total:     summary.FindingCounts.Total,
+						}
+					}
+				}
+			}
+		}
+
 		// Dereference stats pointer
 		var statsValue contracts.ServerStats
 		if stats != nil {
@@ -958,16 +1111,61 @@ func (s *Server) enrichServersWithQuarantineStats(servers []contracts.Server) {
 
 // AddServerRequest represents a request to add a new server
 type AddServerRequest struct {
-	Name        string            `json:"name"`
-	URL         string            `json:"url,omitempty"`
-	Command     string            `json:"command,omitempty"`
-	Args        []string          `json:"args,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	WorkingDir  string            `json:"working_dir,omitempty"`
-	Protocol    string            `json:"protocol,omitempty"`
-	Enabled     *bool             `json:"enabled,omitempty"`
-	Quarantined *bool             `json:"quarantined,omitempty"`
+	Name           string            `json:"name"`
+	URL            string            `json:"url,omitempty"`
+	Command        string            `json:"command,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	WorkingDir     string            `json:"working_dir,omitempty"`
+	Protocol       string            `json:"protocol,omitempty"`
+	Enabled        *bool             `json:"enabled,omitempty"`
+	Quarantined    *bool             `json:"quarantined,omitempty"`
+	ReconnectOnUse *bool             `json:"reconnect_on_use,omitempty"`
+	// Isolation carries per-server Docker isolation overrides (image,
+	// network_mode, extra_args, working_dir, enabled). A nil pointer
+	// means "do not touch isolation config"; an empty-but-present
+	// object on PATCH intentionally clears the overrides.
+	Isolation *IsolationRequest `json:"isolation,omitempty"`
+}
+
+// IsolationRequest is the request-body representation of
+// config.IsolationConfig, using pointer fields for PATCH semantics:
+// a nil pointer means "leave this field alone", a present value
+// (including empty string or empty slice) means "set it".
+type IsolationRequest struct {
+	Enabled     *bool     `json:"enabled,omitempty"`
+	Image       *string   `json:"image,omitempty"`
+	NetworkMode *string   `json:"network_mode,omitempty"`
+	ExtraArgs   *[]string `json:"extra_args,omitempty"`
+	WorkingDir  *string   `json:"working_dir,omitempty"`
+}
+
+// toConfig materializes the request into a config.IsolationConfig.
+// Fields left nil on the request do not appear on the resulting struct
+// so UpdateServer's merge logic (in Controller) can distinguish them
+// from explicit clears.
+func (r *IsolationRequest) toConfig() *config.IsolationConfig {
+	if r == nil {
+		return nil
+	}
+	out := &config.IsolationConfig{}
+	if r.Enabled != nil {
+		out.Enabled = config.BoolPtr(*r.Enabled)
+	}
+	if r.Image != nil {
+		out.Image = *r.Image
+	}
+	if r.NetworkMode != nil {
+		out.NetworkMode = *r.NetworkMode
+	}
+	if r.ExtraArgs != nil {
+		out.ExtraArgs = append([]string(nil), (*r.ExtraArgs)...)
+	}
+	if r.WorkingDir != nil {
+		out.WorkingDir = *r.WorkingDir
+	}
+	return out
 }
 
 // handleAddServer godoc
@@ -1013,12 +1211,20 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Default to enabled=true and quarantined=true for security
+	// Default to enabled=true. Default quarantine follows the global
+	// quarantine_enabled flag (issue #370): secure by default, but
+	// operators can opt out via quarantine_enabled=false. Explicit
+	// values on the request always win.
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
 	quarantined := true
+	if cfgIface := s.controller.GetCurrentConfig(); cfgIface != nil {
+		if cfg, ok := cfgIface.(*config.Config); ok && cfg != nil {
+			quarantined = cfg.DefaultQuarantineForNewServer()
+		}
+	}
 	if req.Quarantined != nil {
 		quarantined = *req.Quarantined
 	}
@@ -1034,6 +1240,9 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 		Protocol:    protocol,
 		Enabled:     enabled,
 		Quarantined: quarantined,
+	}
+	if req.ReconnectOnUse != nil {
+		serverConfig.ReconnectOnUse = *req.ReconnectOnUse
 	}
 
 	// Add server via controller
@@ -1096,6 +1305,128 @@ func (s *Server) handleRemoveServer(w http.ResponseWriter, r *http.Request) {
 		Server:  serverID,
 		Action:  "remove",
 		Success: true,
+	})
+}
+
+// handlePatchServer godoc
+// @Summary Partially update an upstream server
+// @Description Update specific fields of an existing upstream MCP server configuration.
+// @Tags servers
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Security ApiKeyQuery
+// @Param id path string true "Server ID or name"
+// @Param server body AddServerRequest true "Fields to update (all optional)"
+// @Success 200 {object} contracts.SuccessResponse "Server updated successfully"
+// @Failure 400 {object} contracts.ErrorResponse "Bad request - no fields or invalid body"
+// @Failure 404 {object} contracts.ErrorResponse "Server not found"
+// @Failure 500 {object} contracts.ErrorResponse "Internal server error"
+// @Router /api/v1/servers/{id} [patch]
+func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
+	serverName := chi.URLParam(r, "id")
+	if serverName == "" {
+		s.writeError(w, r, http.StatusBadRequest, "Server ID required")
+		return
+	}
+
+	var req AddServerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	// Pre-fetch existing server so we can preserve bool fields the request
+	// did not explicitly set. `config.ServerConfig` uses non-pointer bools
+	// whose zero value cannot be distinguished from "not set" by the time
+	// the update reaches the controller — without this, a PATCH body like
+	// `{"args": [...]}` silently disables a previously-enabled server.
+	var existingSrv *config.ServerConfig
+	if cfg, err := s.controller.GetConfig(); err == nil && cfg != nil {
+		for _, sc := range cfg.Servers {
+			if sc != nil && sc.Name == serverName {
+				existingSrv = sc
+				break
+			}
+		}
+	}
+
+	// Build partial update config - only set fields that were provided
+	updates := &config.ServerConfig{Name: serverName}
+	hasUpdates := false
+
+	if req.URL != "" {
+		updates.URL = req.URL
+		hasUpdates = true
+	}
+	if req.Command != "" {
+		updates.Command = req.Command
+		hasUpdates = true
+	}
+	if req.Args != nil {
+		updates.Args = req.Args
+		hasUpdates = true
+	}
+	if req.Env != nil {
+		updates.Env = req.Env
+		hasUpdates = true
+	}
+	if req.Headers != nil {
+		updates.Headers = req.Headers
+		hasUpdates = true
+	}
+	if req.WorkingDir != "" {
+		updates.WorkingDir = req.WorkingDir
+		hasUpdates = true
+	}
+	if req.Protocol != "" {
+		updates.Protocol = req.Protocol
+		hasUpdates = true
+	}
+	if req.Enabled != nil {
+		updates.Enabled = *req.Enabled
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.Enabled = existingSrv.Enabled
+	}
+	if req.Quarantined != nil {
+		updates.Quarantined = *req.Quarantined
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.Quarantined = existingSrv.Quarantined
+	}
+	if req.ReconnectOnUse != nil {
+		updates.ReconnectOnUse = *req.ReconnectOnUse
+		hasUpdates = true
+	} else if existingSrv != nil {
+		updates.ReconnectOnUse = existingSrv.ReconnectOnUse
+	}
+	if req.Isolation != nil {
+		updates.Isolation = req.Isolation.toConfig()
+		hasUpdates = true
+	}
+
+	if !hasUpdates {
+		s.writeError(w, r, http.StatusBadRequest, "No fields to update")
+		return
+	}
+
+	logger := s.getRequestLogger(r)
+
+	if err := s.controller.UpdateServer(r.Context(), serverName, updates); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			s.writeError(w, r, http.StatusNotFound, err.Error())
+			return
+		}
+		logger.Error("Failed to update server", "server", serverName, "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to update server: %v", err))
+		return
+	}
+
+	logger.Info("Server updated successfully", "server", serverName)
+	s.writeSuccess(w, map[string]interface{}{
+		"message":          fmt.Sprintf("Server '%s' updated successfully", serverName),
+		"restart_required": true,
 	})
 }
 
@@ -1821,6 +2152,29 @@ func (s *Server) handleGetServerTools(w http.ResponseWriter, r *http.Request) {
 	// Convert to typed tools
 	typedTools := contracts.ConvertGenericToolsToTyped(tools)
 
+	// Enrich with approval status from storage
+	enrichedCount := 0
+	var firstErr error
+	for i := range typedTools {
+		status, err := s.controller.GetToolApprovalStatus(serverID, typedTools[i].Name)
+		if err == nil && status != "" {
+			typedTools[i].ApprovalStatus = status
+			enrichedCount++
+		} else if i == 0 {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		fmt.Printf("[DEBUG] Tool approval enrichment: server=%s enriched=%d/%d first_error=%v\n", serverID, enrichedCount, len(typedTools), firstErr)
+	} else {
+		fmt.Printf("[DEBUG] Tool approval enrichment: server=%s enriched=%d/%d\n", serverID, enrichedCount, len(typedTools))
+	}
+
+	// Sort: pending/changed tools first, then approved
+	sort.SliceStable(typedTools, func(i, j int) bool {
+		return toolApprovalPriority(typedTools[i].ApprovalStatus) < toolApprovalPriority(typedTools[j].ApprovalStatus)
+	})
+
 	response := contracts.GetServerToolsResponse{
 		ServerName: serverID,
 		Tools:      typedTools,
@@ -2360,6 +2714,9 @@ func (s *Server) handleGetDiagnostics(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Spec 042: aggregate doctor results into the telemetry registry.
+		recordDoctorTelemetry(s.telemetryRegistry, diag)
+
 		s.writeSuccess(w, diag)
 		return
 	}
@@ -2422,6 +2779,37 @@ func (s *Server) handleGetDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeSuccess(w, response)
+}
+
+// handleGetTelemetryPayload godoc
+// @Summary Preview next telemetry heartbeat payload
+// @Description Render the exact JSON heartbeat payload that mcpproxy would next send to the telemetry endpoint, without making a network call. Counters in the payload reflect the current in-memory state. Spec 042.
+// @Tags telemetry
+// @Produce json
+// @Security ApiKeyAuth
+// @Security ApiKeyQuery
+// @Success 200 {object} contracts.SuccessResponse "Telemetry heartbeat payload"
+// @Failure 503 {object} contracts.ErrorResponse "Telemetry service unavailable"
+// @Router /api/v1/telemetry/payload [get]
+func (s *Server) handleGetTelemetryPayload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	if s.telemetryPayloadProvider == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "telemetry service unavailable")
+		return
+	}
+
+	svc := s.telemetryPayloadProvider()
+	if svc == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "telemetry service unavailable")
+		return
+	}
+
+	payload := svc.BuildPayload()
+	s.writeSuccess(w, payload)
 }
 
 // handleGetTokenStats godoc
@@ -2882,6 +3270,72 @@ func (s *Server) handleApplyConfig(w http.ResponseWriter, r *http.Request) {
 		ValidationErrors:   contracts.ConvertValidationErrors(result.ValidationErrors),
 	}
 
+	s.writeSuccess(w, response)
+}
+
+// handlePatchDockerIsolation godoc
+// @Summary      Toggle global Docker isolation
+// @Description  Convenience endpoint to flip `docker_isolation.enabled` without resending the full config. Persists to disk via the existing config writer — the file watcher then hot-reloads the change. Returns the new state and whether a restart is required for existing connections to pick it up.
+// @Tags         config
+// @Accept       json
+// @Produce      json
+// @Param        payload  body      object{enabled=bool}          true  "New isolation state"
+// @Success      200      {object}  contracts.ConfigApplyResult   "Isolation toggle applied"
+// @Failure      400      {object}  contracts.ErrorResponse       "Invalid JSON payload"
+// @Failure      401      {object}  contracts.ErrorResponse       "Unauthorized - missing or invalid API key"
+// @Failure      500      {object}  contracts.ErrorResponse       "Failed to apply configuration"
+// @Security     ApiKeyAuth
+// @Security     ApiKeyQuery
+// @Router       /api/v1/config/docker-isolation [patch]
+func (s *Server) handlePatchDockerIsolation(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "Invalid JSON payload")
+		return
+	}
+	if payload.Enabled == nil {
+		s.writeError(w, r, http.StatusBadRequest, "Field 'enabled' is required")
+		return
+	}
+
+	// Fetch current config, mutate the single field, and push it back through
+	// the existing apply pipeline so we benefit from validation, change
+	// detection, disk persistence, and hot-reload without duplicating any of
+	// that logic here.
+	cfg, err := s.controller.GetConfig()
+	if err != nil {
+		s.logger.Error("Failed to get configuration for docker-isolation patch", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to read configuration")
+		return
+	}
+	if cfg == nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Configuration not available")
+		return
+	}
+
+	if cfg.DockerIsolation == nil {
+		cfg.DockerIsolation = config.DefaultDockerIsolationConfig()
+	}
+	cfg.DockerIsolation.Enabled = *payload.Enabled
+
+	cfgPath := s.controller.GetConfigPath()
+	result, err := s.controller.ApplyConfig(cfg, cfgPath)
+	if err != nil {
+		s.logger.Error("Failed to apply docker-isolation toggle", "error", err)
+		s.writeError(w, r, http.StatusInternalServerError, fmt.Sprintf("Failed to apply configuration: %v", err))
+		return
+	}
+
+	response := &contracts.ConfigApplyResult{
+		Success:            result.Success,
+		AppliedImmediately: result.AppliedImmediately,
+		RequiresRestart:    result.RequiresRestart,
+		RestartReason:      result.RestartReason,
+		ChangedFields:      result.ChangedFields,
+		ValidationErrors:   contracts.ConvertValidationErrors(result.ValidationErrors),
+	}
 	s.writeSuccess(w, response)
 }
 
@@ -3379,4 +3833,117 @@ func (s *Server) handleExportToolDescriptions(w http.ResponseWriter, r *http.Req
 		"tools":       exports,
 		"count":       len(exports),
 	})
+}
+
+// handleAnnotationCoverage godoc
+// @Summary Get annotation coverage report
+// @Description Reports how many upstream tools have MCP annotations vs don't, broken down by server
+// @Tags annotations
+// @Produce json
+// @Security ApiKeyAuth
+// @Security ApiKeyQuery
+// @Success 200 {object} contracts.SuccessResponse "Annotation coverage report"
+// @Router /api/v1/annotations/coverage [get]
+func (s *Server) handleAnnotationCoverage(w http.ResponseWriter, r *http.Request) {
+	type serverCoverage struct {
+		Name            string  `json:"name"`
+		TotalTools      int     `json:"total_tools"`
+		AnnotatedTools  int     `json:"annotated_tools"`
+		CoveragePercent float64 `json:"coverage_percent"`
+	}
+
+	type coverageResponse struct {
+		TotalTools      int              `json:"total_tools"`
+		AnnotatedTools  int              `json:"annotated_tools"`
+		CoveragePercent float64          `json:"coverage_percent"`
+		Servers         []serverCoverage `json:"servers"`
+	}
+
+	allServers, err := s.controller.GetAllServers()
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Failed to get servers")
+		return
+	}
+
+	resp := coverageResponse{
+		Servers: make([]serverCoverage, 0, len(allServers)),
+	}
+
+	for _, srv := range allServers {
+		name, _ := srv["name"].(string)
+		if name == "" {
+			continue
+		}
+
+		tools, err := s.controller.GetServerTools(name)
+		if err != nil {
+			// Skip servers whose tools can't be retrieved (disconnected, etc.)
+			continue
+		}
+
+		sc := serverCoverage{
+			Name:       name,
+			TotalTools: len(tools),
+		}
+
+		for _, tool := range tools {
+			if hasAnnotationHints(tool) {
+				sc.AnnotatedTools++
+			}
+		}
+
+		if sc.TotalTools > 0 {
+			sc.CoveragePercent = math.Round(float64(sc.AnnotatedTools)/float64(sc.TotalTools)*10000) / 100
+		}
+
+		resp.TotalTools += sc.TotalTools
+		resp.AnnotatedTools += sc.AnnotatedTools
+		resp.Servers = append(resp.Servers, sc)
+	}
+
+	if resp.TotalTools > 0 {
+		resp.CoveragePercent = math.Round(float64(resp.AnnotatedTools)/float64(resp.TotalTools)*10000) / 100
+	}
+
+	s.writeSuccess(w, resp)
+}
+
+// hasAnnotationHints checks if a tool map has meaningful annotation hints.
+// A tool is considered "annotated" if its Annotations is non-nil AND at least
+// one of ReadOnlyHint, DestructiveHint, IdempotentHint, OpenWorldHint is set.
+// Title alone does not count as a meaningful annotation.
+func hasAnnotationHints(tool map[string]interface{}) bool {
+	ann, ok := tool["annotations"]
+	if !ok || ann == nil {
+		return false
+	}
+
+	// Check if it's a *config.ToolAnnotations (direct from stateview)
+	if ta, ok := ann.(*config.ToolAnnotations); ok {
+		return ta.ReadOnlyHint != nil || ta.DestructiveHint != nil ||
+			ta.IdempotentHint != nil || ta.OpenWorldHint != nil
+	}
+
+	// Fallback: check as map (e.g., from JSON round-trip)
+	if m, ok := ann.(map[string]interface{}); ok {
+		for _, key := range []string{"readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"} {
+			if v, exists := m[key]; exists && v != nil {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// toolApprovalPriority returns sort priority (lower = first) for approval status
+func toolApprovalPriority(status string) int {
+	switch status {
+	case "pending":
+		return 0
+	case "changed":
+		return 1
+	default:
+		return 2
+	}
 }

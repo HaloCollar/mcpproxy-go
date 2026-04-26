@@ -25,6 +25,40 @@ type Client struct {
 	logger     *zap.SugaredLogger
 }
 
+// clientVersion holds the build-time version reported in X-MCPProxy-Client.
+// Set via SetClientVersion at process startup. Defaults to "dev" so tests
+// run without an explicit setup step. Spec 042 User Story 1.
+var clientVersion = "dev"
+
+// SetClientVersion sets the version reported in the X-MCPProxy-Client header.
+func SetClientVersion(v string) {
+	if v != "" {
+		clientVersion = v
+	}
+}
+
+// surfaceHeaderTransport wraps another http.RoundTripper to inject the
+// X-MCPProxy-Client header on every outbound request. The header value is
+// "cli/<version>". Spec 042 User Story 1.
+type surfaceHeaderTransport struct {
+	base http.RoundTripper
+}
+
+func (t *surfaceHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("X-MCPProxy-Client") == "" {
+		// Clone the header map so we don't mutate caller-owned state.
+		newHeaders := req.Header.Clone()
+		if newHeaders == nil {
+			newHeaders = http.Header{}
+		}
+		newHeaders.Set("X-MCPProxy-Client", "cli/"+clientVersion)
+		reqCopy := req.Clone(req.Context())
+		reqCopy.Header = newHeaders
+		req = reqCopy
+	}
+	return t.base.RoundTrip(req)
+}
+
 // APIError represents an error from the API that includes request_id for log correlation.
 // T023: Added for CLI error display with request ID
 type APIError struct {
@@ -103,8 +137,10 @@ func NewClientWithAPIKey(endpoint, apiKey string, logger *zap.SugaredLogger) *Cl
 		baseURL: baseURL,
 		apiKey:  apiKey,
 		httpClient: &http.Client{
-			Timeout:   5 * time.Minute, // Generous timeout for long operations
-			Transport: transport,
+			Timeout: 5 * time.Minute, // Generous timeout for long operations
+			// Spec 042: wrap transport so every request carries the
+			// X-MCPProxy-Client: cli/<version> header.
+			Transport: &surfaceHeaderTransport{base: transport},
 		},
 		logger: logger,
 	}
@@ -518,6 +554,116 @@ func (c *Client) GetDiagnostics(ctx context.Context) (map[string]interface{}, er
 	return apiResp.Data, nil
 }
 
+// DiagnosticFixResult is the response from POST /api/v1/diagnostics/fix. Spec 044.
+type DiagnosticFixResult struct {
+	Outcome    string `json:"outcome"` // "success" | "failed" | "blocked"
+	Mode       string `json:"mode"`    // "dry_run" | "execute"
+	Preview    string `json:"preview,omitempty"`
+	FailureMsg string `json:"failure_msg,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
+}
+
+// InvokeDiagnosticFix runs a registered fixer via the daemon's fix endpoint.
+// Destructive fixers default to dry_run on the server side; callers must
+// pass mode="execute" to mutate state. Spec 044.
+func (c *Client) InvokeDiagnosticFix(ctx context.Context, server, code, fixerKey, mode string) (*DiagnosticFixResult, error) {
+	reqBody := map[string]interface{}{
+		"server":    server,
+		"code":      code,
+		"fixer_key": fixerKey,
+	}
+	if mode != "" {
+		reqBody["mode"] = mode
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/api/v1/diagnostics/fix"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call fix endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var apiResp struct {
+		Success   bool                 `json:"success"`
+		Data      *DiagnosticFixResult `json:"data"`
+		Error     string               `json:"error"`
+		RequestID string               `json:"request_id"`
+	}
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !apiResp.Success {
+		return nil, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+	if apiResp.Data == nil {
+		return &DiagnosticFixResult{}, nil
+	}
+	return apiResp.Data, nil
+}
+
+// GetTelemetryPayload retrieves the next telemetry heartbeat payload that
+// mcpproxy would send, rendered with live runtime stats attached. Spec 042.
+// No network call is made by the daemon — the payload reflects the current
+// in-memory state.
+func (c *Client) GetTelemetryPayload(ctx context.Context) (map[string]interface{}, error) {
+	url := c.baseURL + "/api/v1/telemetry/payload"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call telemetry payload API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var apiResp struct {
+		Success   bool                   `json:"success"`
+		Data      map[string]interface{} `json:"data"`
+		Error     string                 `json:"error"`
+		RequestID string                 `json:"request_id"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if !apiResp.Success {
+		return nil, parseAPIError(apiResp.Error, apiResp.RequestID)
+	}
+
+	return apiResp.Data, nil
+}
+
 // GetStatus retrieves server status including running state, listen address, and upstream stats.
 func (c *Client) GetStatus(ctx context.Context) (map[string]interface{}, error) {
 	url := c.baseURL + "/api/v1/status"
@@ -911,16 +1057,17 @@ func (c *Client) TriggerOAuthLogout(ctx context.Context, serverName string) erro
 
 // AddServerRequest represents the request body for adding a server.
 type AddServerRequest struct {
-	Name        string            `json:"name"`
-	URL         string            `json:"url,omitempty"`
-	Command     string            `json:"command,omitempty"`
-	Args        []string          `json:"args,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	WorkingDir  string            `json:"working_dir,omitempty"`
-	Protocol    string            `json:"protocol,omitempty"`
-	Enabled     *bool             `json:"enabled,omitempty"`
-	Quarantined *bool             `json:"quarantined,omitempty"`
+	Name           string            `json:"name"`
+	URL            string            `json:"url,omitempty"`
+	Command        string            `json:"command,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	WorkingDir     string            `json:"working_dir,omitempty"`
+	Protocol       string            `json:"protocol,omitempty"`
+	Enabled        *bool             `json:"enabled,omitempty"`
+	Quarantined    *bool             `json:"quarantined,omitempty"`
+	ReconnectOnUse *bool             `json:"reconnect_on_use,omitempty"`
 }
 
 // AddServerResult represents the result of adding a server.

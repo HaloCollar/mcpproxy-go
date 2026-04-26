@@ -52,7 +52,8 @@ MCPProxy is built in two editions from the same codebase using Go build tags:
 | `internal/teams/workspace/` | Per-user workspace manager for personal upstream servers |
 | `internal/teams/multiuser/` | Multi-user router, tool filtering, activity isolation |
 | `internal/teams/api/` | Server REST API endpoints (user, admin, auth) |
-| `native/macos/` | Future Swift tray app (placeholder) |
+| `native/macos/MCPProxy/` | Swift macOS tray app (SwiftUI, macOS 13+) |
+| `native/macos/MCPProxyUITest/` | Swift MCP server for UI testing (accessibility + screenshots) |
 | `native/windows/` | Future C# tray app (placeholder) |
 
 ### Edition Detection
@@ -205,6 +206,22 @@ mcpproxy token regenerate deploy-bot   # Regenerate token secret
 
 See [docs/features/agent-tokens.md](docs/features/agent-tokens.md) for complete reference.
 
+### Telemetry CLI
+```bash
+mcpproxy telemetry status              # Show telemetry status and anonymous ID
+mcpproxy telemetry enable              # Enable anonymous usage telemetry
+mcpproxy telemetry disable             # Disable telemetry (no data sent)
+```
+
+### Feedback CLI
+```bash
+mcpproxy feedback "message"                          # Submit bug report
+mcpproxy feedback --category feature "Add SAML"      # Feature request
+mcpproxy feedback --category bug --email me@x.com "Crash"  # With contact email
+```
+
+See [docs/features/telemetry.md](docs/features/telemetry.md) for telemetry details and privacy policy.
+
 ### CLI Output Formatting
 ```bash
 mcpproxy upstream list -o json      # JSON output for scripting
@@ -289,6 +306,7 @@ See [docs/socket-communication.md](docs/socket-communication.md) for details.
 - `MCPPROXY_LISTEN` - Override network binding (e.g., `127.0.0.1:8080`)
 - `MCPPROXY_API_KEY` - Set API key for REST API authentication
 - `MCPPROXY_DEBUG` - Enable debug mode
+- `MCPPROXY_TELEMETRY` - Set to `false` to disable anonymous telemetry (overrides config)
 - `HEADLESS` - Run in headless mode (no browser launching)
 
 See [docs/configuration.md](docs/configuration.md) for complete reference.
@@ -324,10 +342,11 @@ See [docs/configuration.md](docs/configuration.md) for complete reference.
 |----------|-------------|
 | `GET /api/v1/status` | Server status and statistics |
 | `GET /api/v1/servers` | List all upstream servers |
-| `POST /api/v1/servers/{name}/enable` | Enable/disable server |
+| `POST /api/v1/servers/{name}/enable` | Enable server |
+| `POST /api/v1/servers/{name}/disable` | Disable server |
 | `POST /api/v1/servers/{name}/quarantine` | Quarantine a server |
 | `POST /api/v1/servers/{name}/unquarantine` | Unquarantine a server |
-| `GET /api/v1/tools` | Search tools across servers |
+| `GET /api/v1/index/search` | Search tools across servers (`?q=query&limit=N`) |
 | `GET /api/v1/activity` | List activity records with filtering |
 | `GET /api/v1/activity/{id}` | Get activity record details |
 | `GET /api/v1/activity/export` | Export activity records (JSON/CSV) |
@@ -339,6 +358,7 @@ See [docs/configuration.md](docs/configuration.md) for complete reference.
 | `POST /api/v1/servers/{id}/tools/approve` | Approve pending/changed tools (Spec 032) |
 | `GET /api/v1/servers/{id}/tools/{tool}/diff` | View tool description/schema changes (Spec 032) |
 | `GET /api/v1/servers/{id}/tools/export` | Export tool approval records (Spec 032) |
+| `POST /api/v1/feedback` | Submit feedback/bug report (proxied to GitHub Issues) |
 | `GET /events` | SSE stream for live updates |
 
 **Authentication**: Use `X-API-Key` header or `?apikey=` query parameter.
@@ -535,6 +555,59 @@ See [docs/features/sensitive-data-detection.md](docs/features/sensitive-data-det
 | `4` | Config error |
 | `5` | Permission error |
 
+## macOS Tray App (native/macos/)
+
+### Building the Tray App
+```bash
+cd native/macos/MCPProxy
+SDK=$(xcrun --sdk macosx --show-sdk-path)
+swiftc -target arm64-apple-macosx13.0 -sdk "$SDK" -module-name MCPProxy -emit-executable -O \
+  -o /tmp/MCPProxy-new \
+  $(find MCPProxy -name "*.swift" -not -path "*/Tests/*" | sort | tr '\n' ' ')
+# Replace in .app bundle:
+cp /tmp/MCPProxy-new /tmp/MCPProxy.app/Contents/MacOS/MCPProxy
+```
+
+### Building the UI Test Tool
+```bash
+cd native/macos/MCPProxyUITest
+SDK=$(xcrun --sdk macosx --show-sdk-path)
+swiftc -target arm64-apple-macosx13.0 -sdk "$SDK" -O -o /tmp/mcpproxy-ui-test Sources/main.swift
+```
+
+### Testing with mcpproxy-ui-test (MCP Server)
+
+The `mcpproxy-ui-test` MCP server provides 7 tools for automated UI verification:
+
+| Tool | Description |
+|------|-------------|
+| `check_accessibility` | Verify Accessibility API permissions |
+| `list_running_apps` | List running macOS apps with bundle IDs |
+| `list_menu_items` | Read status bar menu tree |
+| `click_menu_item` | Click menu items by path |
+| `read_status_bar` | Read status bar item info |
+| `screenshot_window` | Capture app window or full screen (CGWindowListCreateImage) |
+| `screenshot_status_bar_menu` | Open tray menu, capture screenshot, close menu |
+
+**After every macOS tray code change, verify by:**
+1. Build the tray binary (see above)
+2. Replace in `/tmp/MCPProxy.app/Contents/MacOS/MCPProxy` and restart
+3. Use `screenshot_window` to capture the window and visually verify
+4. Use `click_menu_item` + `list_menu_items` to verify tray menu behavior
+5. Use `screenshot_status_bar_menu` for tray menu visual verification
+
+**MCP config** (in Claude Code settings or `~/.claude/settings.json`):
+```json
+{
+  "mcpServers": {
+    "mcpproxy-ui-test": {
+      "command": "/tmp/mcpproxy-ui-test",
+      "args": ["--bundle-id", "com.smartmcpproxy.mcpproxy.dev"]
+    }
+  }
+}
+```
+
 ## Debugging
 
 ```bash
@@ -635,6 +708,17 @@ See `docs/prerelease-builds.md` for download instructions.
 - BBolt database (`~/.mcpproxy/config.db`) - new buckets for users, sessions, user servers (024-teams-multiuser-oauth)
 - Go 1.24 (toolchain go1.24.10) + `github.com/dop251/goja` (existing JS sandbox), `github.com/evanw/esbuild` (new - TypeScript transpilation), `github.com/mark3labs/mcp-go` (MCP protocol), `github.com/spf13/cobra` (CLI) (033-typescript-code-execution)
 - N/A (no new storage requirements) (033-typescript-code-execution)
+- Swift 5.9+ / Xcode 15+ + SwiftUI, AppKit (escape hatches), Sparkle 2.x (SPM), Foundation (URLSession, Process, UNUserNotificationCenter) (037-macos-swift-tray)
+- N/A (tray reads all state from core via REST API — no local persistence per Constitution III) (037-macos-swift-tray)
+- Go 1.24 (toolchain go1.24.10) — primary; Swift 5.9 — macOS tray header change only + `github.com/google/uuid` (existing), `github.com/go-chi/chi/v5` (existing, for `RoutePattern()`), `github.com/spf13/cobra` (existing, new subcommand), `go.uber.org/zap` (existing), stdlib `sync/atomic`, `sync`, `os` (042-telemetry-tier2)
+- Config file `~/.mcpproxy/mcp_config.json` only — counters live in memory and are never persisted between restarts (privacy constraint). No BBolt buckets, no new files. (042-telemetry-tier2)
+- Bash / GitHub Actions YAML for the CI job; Astro 4.x for the website; Markdown for docs. No Go code changes required. (043-linux-package-repos)
+- Go 1.24 (toolchain go1.24.10), Swift 5.9+ (macOS tray only), Bash (DMG post-install script) + `go.etcd.io/bbolt` (existing), `go.uber.org/zap` (existing), `github.com/mark3labs/mcp-go` (existing MCP protocol lib), `github.com/google/uuid` (existing). macOS: `ServiceManagement.framework` (SMAppService, macOS 13+), existing `native/macos/MCPProxy` module. No new external dependencies. (044-retention-telemetry-v3)
+- BBolt (`~/.mcpproxy/config.db`) — new `activation` bucket alongside existing buckets; no migration required because absence of bucket means "fresh install, all flags false". (044-retention-telemetry-v3)
+- Go 1.24 (toolchain go1.24.10), TypeScript 5.9 / Vue 3.5, Swift 5.9 (macOS 13+) (044-diagnostics-taxonomy)
+- No new persistent storage. Diagnostic state lives on in-memory stateview snapshot. Fix-attempt audit rows reuse existing activity log (`ActivityBucket` in BBolt). Telemetry counters are in-memory only (consistent with spec 042). (044-diagnostics-taxonomy)
+- Markdown (agent instruction files, wiki articles); optionally shell or AppleScript helpers for bootstrap idempotency + Paperclip AI (paperclipai/paperclip, MIT) running locally on loopback :3100; Synapbus on kubic; Anthropic API via Paperclip's Claude Code subprocess adapter (045-paperclip-cockpit)
+- Paperclip's embedded Postgres (existing, port 54329); Synapbus DB (existing); no new storage in mcpproxy-go (045-paperclip-cockpit)
 
 ## Recent Changes
 - 001-update-version-display: Added Go 1.24 (toolchain go1.24.10)

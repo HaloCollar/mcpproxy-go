@@ -4,10 +4,12 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"go.uber.org/zap"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
@@ -19,10 +21,10 @@ import (
 
 // BulkOperationResult holds the results of a bulk operation across multiple servers.
 type BulkOperationResult struct {
-	Total      int               `json:"total"`       // Total servers processed
-	Successful int               `json:"successful"`  // Number of successful operations
-	Failed     int               `json:"failed"`      // Number of failed operations
-	Errors     map[string]string `json:"errors"`      // Map of server name to error message
+	Total      int               `json:"total"`      // Total servers processed
+	Successful int               `json:"successful"` // Number of successful operations
+	Failed     int               `json:"failed"`     // Number of failed operations
+	Errors     map[string]string `json:"errors"`     // Map of server name to error message
 }
 
 // Service defines the management interface for all server lifecycle and diagnostic operations.
@@ -133,6 +135,7 @@ type RuntimeOperations interface {
 	GetAllServers() ([]map[string]interface{}, error)
 	BulkEnableServers(serverNames []string, enabled bool) (map[string]error, error)
 	GetServerTools(serverName string) ([]map[string]interface{}, error)
+	GetToolApproval(serverName, toolName string) (*storage.ToolApprovalRecord, error)
 	TriggerOAuthLogin(serverName string) error
 	// TriggerOAuthLoginQuick returns browser status immediately (Spec 020 fix)
 	TriggerOAuthLoginQuick(serverName string) (*core.OAuthStartResult, error)
@@ -184,6 +187,26 @@ func (s *service) checkWriteGates() error {
 
 // ListServers returns all configured servers with aggregate statistics.
 // This is a read operation and never blocked by configuration gates.
+// stringifyDiagnosticField coerces a diagnostic code/severity field to a
+// plain string regardless of whether it was encoded as a Go named-string
+// type (diagnostics.Code, diagnostics.Severity) or a plain string after a
+// JSON round-trip. Spec 044.
+func stringifyDiagnosticField(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case fmt.Stringer:
+		return x.String()
+	default:
+		// Named string types (e.g. `type Code string`) won't match `string`
+		// above, but their underlying value is still a string. Use the
+		// generic `%v` formatter to extract it safely.
+		return fmt.Sprintf("%v", x)
+	}
+}
+
 func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contracts.ServerStats, error) {
 	// Get servers from runtime
 	serversRaw, err := s.runtime.GetAllServers()
@@ -207,6 +230,10 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 		if id, ok := srvRaw["id"].(string); ok {
 			srv.ID = id
 		}
+		// Fallback: use name as ID if id is empty
+		if srv.ID == "" {
+			srv.ID = srv.Name
+		}
 		if protocol, ok := srvRaw["protocol"].(string); ok {
 			srv.Protocol = protocol
 		}
@@ -228,6 +255,76 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 		if lastError, ok := srvRaw["last_error"].(string); ok {
 			srv.LastError = lastError
 		}
+		if url, ok := srvRaw["url"].(string); ok {
+			srv.URL = url
+		}
+		if command, ok := srvRaw["command"].(string); ok {
+			srv.Command = command
+		}
+		if args, ok := srvRaw["args"].([]string); ok {
+			srv.Args = args
+		} else if argsI, ok := srvRaw["args"].([]interface{}); ok {
+			srv.Args = make([]string, 0, len(argsI))
+			for _, a := range argsI {
+				if s, ok := a.(string); ok {
+					srv.Args = append(srv.Args, s)
+				}
+			}
+		}
+		if workingDir, ok := srvRaw["working_dir"].(string); ok {
+			srv.WorkingDir = workingDir
+		}
+
+		// Extract isolation overrides if present. Like OAuth above, both
+		// typed and generic map shapes are accepted so this path works
+		// whether the runtime provides a map[string]interface{} directly
+		// or goes through a json round-trip first.
+		if isoRaw, ok := srvRaw["isolation"].(map[string]interface{}); ok && isoRaw != nil {
+			iso := &contracts.IsolationConfig{}
+			if enabled, ok := isoRaw["enabled"].(bool); ok {
+				iso.Enabled = enabled
+			}
+			if img, ok := isoRaw["image"].(string); ok {
+				iso.Image = img
+			}
+			if nm, ok := isoRaw["network_mode"].(string); ok {
+				iso.NetworkMode = nm
+			}
+			if extra, ok := isoRaw["extra_args"].([]string); ok {
+				iso.ExtraArgs = extra
+			} else if extraI, ok := isoRaw["extra_args"].([]interface{}); ok {
+				iso.ExtraArgs = make([]string, 0, len(extraI))
+				for _, a := range extraI {
+					if s, ok := a.(string); ok {
+						iso.ExtraArgs = append(iso.ExtraArgs, s)
+					}
+				}
+			}
+			if wd, ok := isoRaw["working_dir"].(string); ok {
+				iso.WorkingDir = wd
+			}
+			srv.Isolation = iso
+		}
+
+		// Populate resolved isolation defaults so UI clients (macOS tray,
+		// web UI) can render meaningful placeholders for the override
+		// fields. Only meaningful for stdio servers — HTTP servers don't
+		// run in containers. We compute this regardless of whether the
+		// server is currently isolated; the UI uses it as a hint.
+		if srv.Protocol == "stdio" && srv.Command != "" && s.config != nil && s.config.DockerIsolation != nil {
+			im := core.NewIsolationManager(s.config.DockerIsolation)
+			tmpCfg := &config.ServerConfig{Name: srv.Name, Command: srv.Command}
+			if defaults := im.ResolveDefaults(tmpCfg); defaults != nil {
+				srv.IsolationDefaults = &contracts.IsolationDefaults{
+					RuntimeType: defaults.RuntimeType,
+					Image:       defaults.Image,
+					NetworkMode: defaults.NetworkMode,
+					ExtraArgs:   defaults.ExtraArgs,
+					WorkingDir:  defaults.ContainerWorkingDir,
+				}
+			}
+		}
+
 		if authenticated, ok := srvRaw["authenticated"].(bool); ok {
 			srv.Authenticated = authenticated
 		}
@@ -303,9 +400,52 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 			srv.Updated = updated
 		}
 
+		// Extract reconnect_on_use
+		if reconnectOnUse, ok := srvRaw["reconnect_on_use"].(bool); ok {
+			srv.ReconnectOnUse = reconnectOnUse
+		}
+
 		// Extract unified health status
 		if health, ok := srvRaw["health"].(*contracts.HealthStatus); ok {
 			srv.Health = health
+		}
+
+		// Spec 044 — extract structured diagnostic + stable error code.
+		// The runtime layer already encodes these as a map[string]interface{}
+		// alongside the raw code string.
+		if errCode, ok := srvRaw["error_code"].(string); ok && errCode != "" {
+			srv.ErrorCode = errCode
+		}
+		if diagRaw, ok := srvRaw["diagnostic"].(map[string]interface{}); ok && diagRaw != nil {
+			d := &contracts.Diagnostic{}
+			// Code arrives as diagnostics.Code (a named string type) when the
+			// map is produced directly by runtime.GetAllServers, and as a
+			// plain string after a JSON round-trip. Handle both.
+			d.Code = stringifyDiagnosticField(diagRaw["code"])
+			d.Severity = stringifyDiagnosticField(diagRaw["severity"])
+			if cause, ok := diagRaw["cause"].(string); ok {
+				d.Cause = cause
+			}
+			if detected, ok := diagRaw["detected_at"].(time.Time); ok && !detected.IsZero() {
+				t := detected
+				d.DetectedAt = &t
+			}
+			if um, ok := diagRaw["user_message"].(string); ok {
+				d.UserMessage = um
+			}
+			if docs, ok := diagRaw["docs_url"].(string); ok {
+				d.DocsURL = docs
+			}
+			// fix_steps arrives as the concrete []diagnostics.FixStep slice
+			// from runtime.GetAllServers, or as []interface{} after a JSON
+			// round-trip. Use a JSON round-trip that works for both shapes —
+			// it's cheap and sidesteps the type-assertion explosion.
+			if steps, ok := diagRaw["fix_steps"]; ok && steps != nil {
+				if raw, err := json.Marshal(steps); err == nil {
+					_ = json.Unmarshal(raw, &d.FixSteps)
+				}
+			}
+			srv.Diagnostic = d
 		}
 
 		servers = append(servers, srv)
@@ -694,6 +834,17 @@ func (s *service) GetServerTools(ctx context.Context, name string) ([]map[string
 	tools, err := s.runtime.GetServerTools(name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tools: %w", err)
+	}
+
+	// Enrich with approval status from storage
+	for i, tool := range tools {
+		toolName, _ := tool["name"].(string)
+		if toolName == "" {
+			continue
+		}
+		if record, err := s.runtime.GetToolApproval(name, toolName); err == nil && record != nil {
+			tools[i]["approval_status"] = string(record.Status)
+		}
 	}
 
 	return tools, nil

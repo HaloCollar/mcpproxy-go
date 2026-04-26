@@ -9,9 +9,20 @@ export const useSystemStore = defineStore('system', () => {
   const eventSource = ref<EventSource | null>(null)
   const connected = ref(false)
   const currentTheme = ref<string>('corporate')
+  const sidebarCollapsed = ref<boolean>(
+    (() => {
+      try {
+        return localStorage.getItem('mcpproxy-sidebar-collapsed') === '1'
+      } catch {
+        return false
+      }
+    })()
+  )
   const toasts = ref<Toast[]>([])
   const info = ref<InfoResponse | null>(null)
   const routing = ref<RoutingInfo | null>(null)
+  const checkingForUpdates = ref(false)
+  const updateCheckedAt = ref<string | null>(null)
 
   // Available themes
   const themes: Theme[] = [
@@ -163,6 +174,17 @@ export const useSystemStore = defineStore('system', () => {
       }
     })
 
+    // Listen for security.scanner_changed events so the Security page can
+    // refresh the scanner list when a background image pull finishes (spec 039).
+    es.addEventListener('security.scanner_changed', (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        window.dispatchEvent(new CustomEvent('mcpproxy:scanner-changed', { detail: data }))
+      } catch (error) {
+        console.error('Failed to parse SSE security.scanner_changed event:', error)
+      }
+    })
+
     // Listen for activity events (tool calls, policy decisions, etc.)
     es.addEventListener('activity.tool_call.started', (event) => {
       try {
@@ -310,6 +332,18 @@ export const useSystemStore = defineStore('system', () => {
     }
   }
 
+  function toggleSidebar() {
+    sidebarCollapsed.value = !sidebarCollapsed.value
+    try {
+      localStorage.setItem(
+        'mcpproxy-sidebar-collapsed',
+        sidebarCollapsed.value ? '1' : '0'
+      )
+    } catch {
+      // localStorage unavailable (private browsing, etc.) — just keep in-memory
+    }
+  }
+
   function addToast(toast: Omit<Toast, 'id'>): string {
     const id = Math.random().toString(36).substr(2, 9)
     const newToast: Toast = {
@@ -346,9 +380,49 @@ export const useSystemStore = defineStore('system', () => {
       const response = await api.getInfo()
       if (response.success && response.data) {
         info.value = response.data
+        if (response.data.update?.checked_at) {
+          updateCheckedAt.value = response.data.update.checked_at
+        }
       }
     } catch (error) {
       console.error('Failed to fetch info:', error)
+    }
+  }
+
+  async function checkForUpdates(): Promise<{ ok: boolean; error?: string }> {
+    if (checkingForUpdates.value) return { ok: false, error: 'already checking' }
+    checkingForUpdates.value = true
+    try {
+      const response = await api.getInfo({ refresh: true })
+      if (response.success && response.data) {
+        info.value = response.data
+        updateCheckedAt.value = response.data.update?.checked_at ?? new Date().toISOString()
+        const checkErr = response.data.update?.check_error
+        if (checkErr) {
+          addToast({ type: 'error', title: 'Update check failed', message: checkErr })
+          return { ok: false, error: checkErr }
+        }
+        if (response.data.update?.available) {
+          addToast({
+            type: 'info',
+            title: 'Update available',
+            message: response.data.update.latest_version || '',
+          })
+        } else {
+          addToast({ type: 'success', title: 'You are running the latest version.' })
+        }
+        return { ok: true }
+      }
+      const err = response.error || 'Request failed'
+      addToast({ type: 'error', title: 'Update check failed', message: err })
+      return { ok: false, error: err }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error('Failed to check for updates:', error)
+      addToast({ type: 'error', title: 'Update check failed', message: msg })
+      return { ok: false, error: msg }
+    } finally {
+      checkingForUpdates.value = false
     }
   }
 
@@ -375,6 +449,8 @@ export const useSystemStore = defineStore('system', () => {
     themes,
     info,
     routing,
+    checkingForUpdates,
+    updateCheckedAt,
 
     // Computed
     isRunning,
@@ -385,16 +461,19 @@ export const useSystemStore = defineStore('system', () => {
     updateAvailable,
     latestVersion,
     routingMode,
+    sidebarCollapsed,
 
     // Actions
     connectEventSource,
     disconnectEventSource,
     setTheme,
     loadTheme,
+    toggleSidebar,
     addToast,
     removeToast,
     clearToasts,
     fetchInfo,
     fetchRouting,
+    checkForUpdates,
   }
 })

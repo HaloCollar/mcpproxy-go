@@ -31,6 +31,8 @@ const (
 	ActivityTypeConfigChange ActivityType = "config_change"
 	// ActivityTypeToolQuarantineChange represents a tool-level quarantine state change (Spec 032)
 	ActivityTypeToolQuarantineChange ActivityType = "tool_quarantine_change"
+	// ActivityTypeSecurityScan represents a security scan event (Spec 039)
+	ActivityTypeSecurityScan ActivityType = "security_scan"
 )
 
 // ValidActivityTypes is the list of all valid activity types for filtering (Spec 024)
@@ -44,6 +46,7 @@ var ValidActivityTypes = []string{
 	string(ActivityTypeInternalToolCall),
 	string(ActivityTypeConfigChange),
 	string(ActivityTypeToolQuarantineChange),
+	string(ActivityTypeSecurityScan),
 }
 
 // ActivitySource indicates how the activity was triggered
@@ -56,6 +59,8 @@ const (
 	ActivitySourceCLI ActivitySource = "cli"
 	// ActivitySourceAPI indicates the activity was triggered via REST API
 	ActivitySourceAPI ActivitySource = "api"
+	// ActivitySourceInternal indicates the activity was triggered by an internal subsystem (Spec 039)
+	ActivitySourceInternal ActivitySource = "internal"
 )
 
 // ActivityRecord represents a single activity log entry stored in BBolt
@@ -130,13 +135,28 @@ func DefaultActivityFilter() ActivityFilter {
 	}
 }
 
-// Validate validates and normalizes the filter
+// Validate validates and normalizes the filter for regular list queries.
 func (f *ActivityFilter) Validate() {
 	if f.Limit <= 0 {
 		f.Limit = 50
 	}
 	if f.Limit > 100 {
 		f.Limit = 100
+	}
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
+}
+
+// ValidateForExport validates and normalizes the filter for export queries.
+// Export allows larger limits than regular list queries.
+// Default: 10000, Max: 50000.
+func (f *ActivityFilter) ValidateForExport() {
+	if f.Limit <= 0 {
+		f.Limit = 10000
+	}
+	if f.Limit > 50000 {
+		f.Limit = 50000
 	}
 	if f.Offset < 0 {
 		f.Offset = 0

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/cache"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/diagnostics"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/experiments"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/health"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/index"
@@ -28,7 +31,9 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server/tokens"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/truncate"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream"
@@ -75,6 +80,7 @@ type Runtime struct {
 	tokenizer         tokens.Tokenizer
 	refreshManager    *oauth.RefreshManager // Proactive OAuth token refresh
 	updateChecker     *updatecheck.Checker  // Background version checking
+	telemetryService  *telemetry.Service    // Anonymous usage telemetry (Spec 036)
 	managementService interface{}           // Initialized later to avoid import cycle
 	activityService   *ActivityService      // Activity logging service
 
@@ -84,6 +90,21 @@ type Runtime struct {
 	// Tool discovery deduplication: tracks servers with in-progress reactive discovery
 	// Key: serverName, Value: struct{} (presence indicates discovery in progress)
 	discoveryInProgress sync.Map
+
+	// Schema v3 (telemetry): time-cached Docker daemon availability. The
+	// probe has a 2s `docker info` cost, so we don't want to run it on every
+	// heartbeat — but we also can't memoize it for the whole process lifetime:
+	// users often install or launch Docker Desktop after mcpproxy starts, and
+	// we want the next heartbeat to pick up the change. Cache semantics:
+	//   - Fresh positive result reused for up to 15 minutes.
+	//   - Fresh negative result reused for only 5 minutes so a late Docker
+	//     launch flips `server_docker_available_bool` promptly.
+	// A transition between states is logged at info level; steady-state
+	// probes stay silent to keep logs clean.
+	dockerProbeMu     sync.Mutex
+	dockerProbeResult bool
+	dockerProbedAt    time.Time
+	dockerProbeKnown  bool
 
 	appCtx    context.Context
 	appCancel context.CancelFunc
@@ -186,12 +207,17 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 			zap.Int("cleanup_interval_min", cfg.ActivityCleanupIntervalMin))
 	}
 
-	// Log warnings for deprecated config fields
-	if deprecated := config.CheckDeprecatedFields(cfgPath); len(deprecated) > 0 {
-		for _, df := range deprecated {
-			logger.Warn("Deprecated config field",
+	// Auto-clean deprecated config fields (backup created at .bak before modification).
+	if removed, err := config.CleanDeprecatedFields(cfgPath); err != nil {
+		logger.Warn("Failed to auto-clean deprecated config fields", zap.Error(err))
+	} else if len(removed) > 0 {
+		logger.Info("Auto-cleaned deprecated config fields",
+			zap.String("backup", cfgPath+".bak"),
+			zap.Int("fields_removed", len(removed)))
+		for _, df := range removed {
+			logger.Info("Removed deprecated field",
 				zap.String("field", df.JSONKey),
-				zap.String("message", df.Message),
+				zap.String("reason", df.Message),
 				zap.String("replacement", df.Replacement))
 		}
 	}
@@ -1086,6 +1112,15 @@ func (r *Runtime) GetRecentSessions(limit int) ([]*contracts.MCPSession, int, er
 		})
 	}
 
+	// Stable order for UI consumers: most-recently-active first, break ties
+	// by session ID so the list doesn't reshuffle on identical timestamps.
+	sort.SliceStable(sessions, func(i, j int) bool {
+		if !sessions[i].LastActivity.Equal(sessions[j].LastActivity) {
+			return sessions[i].LastActivity.After(sessions[j].LastActivity)
+		}
+		return sessions[i].ID < sessions[j].ID
+	})
+
 	return sessions, total, nil
 }
 
@@ -1688,6 +1723,7 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 		}
 
 		serverMap := map[string]interface{}{
+			"id":              serverStatus.Name,
 			"name":            serverStatus.Name,
 			"url":             url,
 			"command":         command,
@@ -1705,6 +1741,60 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 			"last_retry_time": nil,
 			"oauth":           oauthConfig,
 			"authenticated":   authenticated,
+		}
+
+		// Expose config fields the UI needs for edit mode (args, working
+		// dir, isolation overrides). These used to be dropped on the
+		// floor here, so the tray/webui could not round-trip stdio
+		// server configuration.
+		if serverStatus.Config != nil {
+			if len(serverStatus.Config.Args) > 0 {
+				serverMap["args"] = serverStatus.Config.Args
+			}
+			if serverStatus.Config.WorkingDir != "" {
+				serverMap["working_dir"] = serverStatus.Config.WorkingDir
+			}
+			if iso := serverStatus.Config.Isolation; iso != nil {
+				isoMap := map[string]interface{}{
+					"enabled": iso.IsEnabled(),
+				}
+				if iso.Image != "" {
+					isoMap["image"] = iso.Image
+				}
+				if iso.NetworkMode != "" {
+					isoMap["network_mode"] = iso.NetworkMode
+				}
+				if len(iso.ExtraArgs) > 0 {
+					isoMap["extra_args"] = iso.ExtraArgs
+				}
+				if iso.WorkingDir != "" {
+					isoMap["working_dir"] = iso.WorkingDir
+				}
+				serverMap["isolation"] = isoMap
+			}
+		}
+
+		// Add reconnect_on_use from config
+		if serverStatus.Config != nil && serverStatus.Config.ReconnectOnUse {
+			serverMap["reconnect_on_use"] = true
+		}
+
+		// Spec 044: include structured diagnostic error when available.
+		if serverStatus.Diagnostic != nil {
+			d := serverStatus.Diagnostic
+			diagMap := map[string]interface{}{
+				"code":        d.Code,
+				"severity":    d.Severity,
+				"cause":       d.Cause,
+				"detected_at": d.DetectedAt,
+			}
+			if entry, ok := diagnostics.Get(d.Code); ok {
+				diagMap["user_message"] = entry.UserMessage
+				diagMap["fix_steps"] = entry.FixSteps
+				diagMap["docs_url"] = entry.DocsURL
+			}
+			serverMap["diagnostic"] = diagMap
+			serverMap["error_code"] = string(d.Code)
 		}
 
 		// Add OAuth status fields if available
@@ -1774,6 +1864,16 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 		result = append(result, serverMap)
 	}
 
+	// Stable alphabetical order by name — StateView is backed by a map, so
+	// iteration order is non-deterministic. UI consumers (tray, web) expect
+	// a stable list so the "Servers Needing Attention" and similar filtered
+	// views don't shuffle between polls.
+	sort.SliceStable(result, func(i, j int) bool {
+		ni, _ := result[i]["name"].(string)
+		nj, _ := result[j]["name"].(string)
+		return ni < nj
+	})
+
 	r.logger.Debug("GetAllServers completed", zap.Int("server_count", len(result)))
 	return result, nil
 }
@@ -1798,6 +1898,7 @@ func (r *Runtime) getAllServersLegacy() ([]map[string]interface{}, error) {
 	result := make([]map[string]interface{}, 0, len(servers))
 	for _, srv := range servers {
 		serverInfo := map[string]interface{}{
+			"id":          srv.Name,
 			"name":        srv.Name,
 			"url":         srv.URL,
 			"command":     srv.Command,
@@ -1967,7 +2068,20 @@ func (r *Runtime) RefreshOAuthToken(serverName string) error {
 
 	// Delegate to upstream manager to refresh the token
 	if err := r.upstreamManager.RefreshOAuthToken(serverName); err != nil {
-		return fmt.Errorf("failed to refresh OAuth token: %w", err)
+		// Spec 044 — attribute terminal refresh outcomes to a stable
+		// diagnostics code so downstream consumers (web UI ErrorPanel,
+		// tray, doctor fix) don't have to re-parse free-text messages.
+		// The string-match classifier fallback catches these too, but
+		// explicit typing is cheaper and survives message rewording.
+		wrapped := fmt.Errorf("failed to refresh OAuth token: %w", err)
+		msg := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(msg, "expired") || strings.Contains(msg, "no refresh token"):
+			return diagnostics.WrapOAuthRefreshExpired(wrapped)
+		case strings.Contains(msg, "403") || strings.Contains(msg, "invalid_grant"):
+			return diagnostics.WrapOAuthRefresh403(wrapped)
+		}
+		return wrapped
 	}
 
 	return nil
@@ -2001,6 +2115,288 @@ func (r *Runtime) RefreshVersionInfo() *updatecheck.VersionInfo {
 		return nil
 	}
 	return r.updateChecker.CheckNow()
+}
+
+// SetTelemetry initializes the telemetry service with the given version and edition.
+// This should be called once during server startup.
+func (r *Runtime) SetTelemetry(version, edition string) {
+	if r.telemetryService != nil {
+		return
+	}
+
+	r.telemetryService = telemetry.New(r.cfg, r.cfgPath, version, edition, r.logger)
+	r.telemetryService.SetRuntimeStats(r)
+
+	// Spec 044: wire the activation store onto the shared BBolt DB. The
+	// bucket is created lazily on first write, but we proactively ensure it
+	// exists at startup to avoid write-race on concurrent first-ever events
+	// (MCP initialize + upstream connect-success can arrive in the same tick).
+	if r.storageManager != nil {
+		if db := r.storageManager.GetDB(); db != nil {
+			if err := telemetry.EnsureActivationBucket(db); err != nil {
+				r.logger.Warn("Failed to ensure activation bucket", zap.Error(err))
+			}
+			store := telemetry.NewActivationStore()
+			r.telemetryService.SetActivationStore(store, db)
+
+			// Spec 044 (T052): one-shot installer-launch marker. When the
+			// installer invokes mcpproxy with MCPPROXY_LAUNCHED_BY=installer,
+			// persist a pending flag so the first heartbeat (which may be
+			// minutes away) can emit launch_source=installer even across
+			// restarts. The flag is cleared the moment the heartbeat builder
+			// sees it (resolveLaunchSource).
+			if os.Getenv("MCPPROXY_LAUNCHED_BY") == "installer" {
+				if err := store.SetInstallerPending(db, true); err != nil {
+					r.logger.Debug("Failed to set installer_heartbeat_pending", zap.Error(err))
+				} else {
+					r.logger.Info("Installer-launched process: installer_heartbeat_pending=true")
+				}
+			}
+		}
+	}
+
+	r.logger.Info("Telemetry service initialized", zap.String("version", version), zap.String("edition", edition))
+}
+
+// TelemetryService returns the telemetry service instance.
+func (r *Runtime) TelemetryService() *telemetry.Service {
+	return r.telemetryService
+}
+
+// TelemetryRegistry returns the Tier 2 counter registry, or nil if telemetry
+// has not been initialized yet. Callers can record events without nil-checking
+// — use telemetry.RecordSurfaceOn(reg, ...) which is nil-safe.
+func (r *Runtime) TelemetryRegistry() *telemetry.CounterRegistry {
+	if r.telemetryService == nil {
+		return nil
+	}
+	return r.telemetryService.Registry()
+}
+
+// RecordMCPClientForActivation records a sanitized MCP client name and marks
+// the first-ever-client flag (Spec 044 US2). No-op if activation store not
+// wired or if the raw name cannot be plumbed through (nil-safe all the way
+// down). Intentionally takes the raw name; sanitization happens inside the
+// store.
+func (r *Runtime) RecordMCPClientForActivation(rawClientName string) {
+	if r.telemetryService == nil {
+		return
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
+	}
+	if err := store.MarkFirstMCPClient(db); err != nil {
+		r.logger.Debug("activation: MarkFirstMCPClient failed", zap.Error(err))
+	}
+	if err := store.RecordMCPClient(db, rawClientName); err != nil {
+		r.logger.Debug("activation: RecordMCPClient failed", zap.Error(err))
+	}
+}
+
+// RecordRetrieveToolsCallForActivation bumps the 24h retrieve_tools counter
+// and marks the first-ever-call flag (Spec 044 US2). No-op if the activation
+// store is not wired.
+func (r *Runtime) RecordRetrieveToolsCallForActivation() {
+	if r.telemetryService == nil {
+		return
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
+	}
+	if err := store.MarkFirstRetrieveToolsCall(db); err != nil {
+		r.logger.Debug("activation: MarkFirstRetrieveToolsCall failed", zap.Error(err))
+	}
+	if err := store.IncrementRetrieveToolsCall(db); err != nil {
+		r.logger.Debug("activation: IncrementRetrieveToolsCall failed", zap.Error(err))
+	}
+}
+
+// RecordTokensSavedForActivation adds n to the 24h tokens-saved estimator.
+// n <= 0 is a no-op. Spec 044 US2.
+func (r *Runtime) RecordTokensSavedForActivation(n int) {
+	if n <= 0 || r.telemetryService == nil {
+		return
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
+	}
+	if err := store.AddTokensSaved(db, n); err != nil {
+		r.logger.Debug("activation: AddTokensSaved failed", zap.Error(err))
+	}
+}
+
+// MarkFirstConnectedServerForActivation sets the first_connected_server_ever
+// flag. Called from the supervisor's connect-success callback. Spec 044 US2.
+func (r *Runtime) MarkFirstConnectedServerForActivation() {
+	if r.telemetryService == nil {
+		return
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return
+	}
+	if err := store.MarkFirstConnectedServer(db); err != nil {
+		r.logger.Debug("activation: MarkFirstConnectedServer failed", zap.Error(err))
+	}
+}
+
+// GetServerCount returns the total number of configured servers (implements telemetry.RuntimeStats).
+func (r *Runtime) GetServerCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.cfg == nil {
+		return 0
+	}
+	return len(r.cfg.Servers)
+}
+
+// GetConnectedServerCount returns the number of connected upstream servers (implements telemetry.RuntimeStats).
+func (r *Runtime) GetConnectedServerCount() int {
+	if r.upstreamManager == nil {
+		return 0
+	}
+	stats := r.upstreamManager.GetStats()
+	if stats == nil {
+		return 0
+	}
+	servers, ok := stats["servers"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	count := 0
+	for _, serverStat := range servers {
+		if stat, ok := serverStat.(map[string]interface{}); ok {
+			if connected, ok := stat["connected"].(bool); ok && connected {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// GetToolCount returns the total number of indexed tools (implements telemetry.RuntimeStats).
+func (r *Runtime) GetToolCount() int {
+	if r.upstreamManager == nil {
+		return 0
+	}
+	stats := r.upstreamManager.GetStats()
+	return extractToolCount(stats)
+}
+
+// GetRoutingMode returns the current routing mode (implements telemetry.RuntimeStats).
+func (r *Runtime) GetRoutingMode() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.cfg == nil || r.cfg.RoutingMode == "" {
+		return config.RoutingModeRetrieveTools
+	}
+	return r.cfg.RoutingMode
+}
+
+// IsQuarantineEnabled returns whether tool-level quarantine is enabled (implements telemetry.RuntimeStats).
+func (r *Runtime) IsQuarantineEnabled() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.cfg == nil {
+		return true
+	}
+	return r.cfg.IsQuarantineEnabled()
+}
+
+// dockerProbeTTLPositive is how long a successful docker daemon probe stays
+// cached. 15m is a balance between avoiding the 2s `docker info` cost on
+// every heartbeat and not sitting on a stale "true" if the user stops Docker.
+const dockerProbeTTLPositive = 15 * time.Minute
+
+// dockerProbeTTLNegative is how long a failed probe stays cached. Kept short
+// (5m) so users who launch Docker Desktop *after* mcpproxy started see
+// `server_docker_available_bool` flip at the next heartbeat rather than the
+// next process restart.
+const dockerProbeTTLNegative = 5 * time.Minute
+
+// IsDockerAvailable reports whether the host has a reachable Docker daemon
+// (implements telemetry.RuntimeStats, schema v3). Uses a time-based cache —
+// see dockerProbeTTLPositive / dockerProbeTTLNegative for reasoning.
+func (r *Runtime) IsDockerAvailable() bool {
+	r.dockerProbeMu.Lock()
+	defer r.dockerProbeMu.Unlock()
+
+	if r.dockerProbeKnown {
+		age := time.Since(r.dockerProbedAt)
+		ttl := dockerProbeTTLPositive
+		if !r.dockerProbeResult {
+			ttl = dockerProbeTTLNegative
+		}
+		if age < ttl {
+			return r.dockerProbeResult
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// Resolve docker via shellwrap so we find Docker Desktop / Homebrew /
+	// Colima installs even when mcpproxy was launched from a LaunchAgent /
+	// tray with a minimal inherited PATH (see issue: tray "Docker daemon not
+	// available" warning despite healthy daemon + socket).
+	dockerBin, resolveErr := shellwrap.ResolveDockerPath(r.logger)
+	if resolveErr != nil || dockerBin == "" {
+		dockerBin = "docker"
+	}
+	cmd := exec.CommandContext(ctx, dockerBin, "info", "--format", "{{.ServerVersion}}")
+	err := cmd.Run()
+	newResult := err == nil
+
+	// Log only on state changes (or first probe) so repeated heartbeats don't
+	// spam the log. Rationale: users care about transitions ("Docker just
+	// became available") far more than steady-state telemetry probes.
+	if r.logger != nil && (!r.dockerProbeKnown || r.dockerProbeResult != newResult) {
+		if newResult {
+			r.logger.Info("docker daemon probe: available")
+		} else {
+			r.logger.Info("docker daemon probe: unavailable", zap.Error(err))
+		}
+	}
+
+	r.dockerProbeResult = newResult
+	r.dockerProbedAt = time.Now()
+	r.dockerProbeKnown = true
+	return r.dockerProbeResult
+}
+
+// GetDockerIsolatedServerCount returns how many currently-configured servers
+// the runtime actually wraps in a Docker container (implements
+// telemetry.RuntimeStats, schema v3).
+//
+// Implementation note: we reuse core.IsolationManager.ShouldIsolate — the
+// same function the stdio connection path consults — so the count matches
+// the runtime's real behavior rather than a config-only approximation.
+// When DockerIsolation is nil or disabled globally, ShouldIsolate returns
+// false for every server, giving a count of 0.
+func (r *Runtime) GetDockerIsolatedServerCount() int {
+	r.mu.RLock()
+	cfg := r.cfg
+	r.mu.RUnlock()
+	if cfg == nil {
+		return 0
+	}
+	im := core.NewIsolationManager(cfg.DockerIsolation)
+	count := 0
+	for _, srv := range cfg.Servers {
+		if srv == nil {
+			continue
+		}
+		if im.ShouldIsolate(srv) {
+			count++
+		}
+	}
+	return count
 }
 
 // Activity logging methods (RFC-003)

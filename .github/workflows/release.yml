@@ -79,9 +79,11 @@ jobs:
         id: generate
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Pass via env to avoid shell injection from commit messages containing
+          # quotes, backticks, or other shell metacharacters (see release run 24950486759).
+          VERSION: ${{ github.ref_name }}
+          COMMITS: ${{ steps.commits.outputs.commits }}
         run: |
-          VERSION="${{ github.ref_name }}"
-          COMMITS="${{ steps.commits.outputs.commits }}"
 
           # Check if API key is configured
           if [ -z "$ANTHROPIC_API_KEY" ]; then
@@ -188,6 +190,7 @@ jobs:
     # Only run on version tags
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -214,13 +217,13 @@ jobs:
             cgo: "1"
             name: mcpproxy-windows-arm64.exe
             archive_format: zip
-          - os: macos-14
+          - os: macos-15
             goos: darwin
             goarch: amd64
             cgo: "1"
             name: mcpproxy-darwin-amd64
             archive_format: tar.gz
-          - os: macos-14
+          - os: macos-15
             goos: darwin
             goarch: arm64
             cgo: "1"
@@ -378,11 +381,11 @@ jobs:
           CGO_ENABLED: ${{ matrix.cgo }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          # ✅ Force minimum supported macOS version for compatibility
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          # ✅ Force minimum supported macOS version for compatibility (13.0 for Swift tray app)
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
           # Defensive CGO flags to ensure proper deployment target
-          CGO_CFLAGS: "-mmacosx-version-min=12.0"
-          CGO_LDFLAGS: "-mmacosx-version-min=12.0"
+          CGO_CFLAGS: "-mmacosx-version-min=13.0"
+          CGO_LDFLAGS: "-mmacosx-version-min=13.0"
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
           LDFLAGS="-s -w -X main.version=${VERSION} -X github.com/smart-mcp-proxy/mcpproxy-go/internal/httpapi.buildVersion=${VERSION}"
@@ -414,6 +417,21 @@ jobs:
             fi
 
             go build -ldflags "${LDFLAGS}" -o ${TRAY_BINARY} ./cmd/mcpproxy-tray
+          fi
+
+          # Build Swift tray app (macOS only — replaces Go tray in .app bundle for DMG/PKG)
+          if [ "$EDITION" != "server" ] && [ "${{ matrix.goos }}" = "darwin" ]; then
+            chmod +x scripts/build-swift-app.sh
+            OUTPUT_DIR="$(pwd)/swift-build"
+            mkdir -p "$OUTPUT_DIR"
+            ./scripts/build-swift-app.sh "${VERSION}" "${{ matrix.goarch }}" "$OUTPUT_DIR"
+            SWIFT_APP="$OUTPUT_DIR/MCPProxy.app"
+            if [ -d "$SWIFT_APP" ]; then
+              echo "SWIFT_APP_PATH=$SWIFT_APP" >> $GITHUB_ENV
+            else
+              echo "❌ Swift app build failed"
+              exit 1
+            fi
           fi
 
           # Code sign macOS binaries
@@ -628,6 +646,12 @@ jobs:
             tar -czf "${LATEST_ARCHIVE_BASE}.tar.gz" ${FILES_TO_ARCHIVE}
           fi
 
+      - name: Build Linux .deb and .rpm packages
+        if: matrix.goos == 'linux' && matrix.edition != 'server'
+        uses: ./.github/actions/build-linux-packages
+        with:
+          goarch: ${{ matrix.goarch }}
+
       - name: Install Inno Setup (Windows)
         if: matrix.goos == 'windows'
         shell: pwsh
@@ -685,19 +709,25 @@ jobs:
         if: matrix.goos == 'darwin'
         env:
           # Ensure DMG creation also uses correct deployment target
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
-          CGO_CFLAGS: "-mmacosx-version-min=12.0"
-          CGO_LDFLAGS: "-mmacosx-version-min=12.0"
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+          CGO_CFLAGS: "-mmacosx-version-min=13.0"
+          CGO_LDFLAGS: "-mmacosx-version-min=13.0"
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
           chmod +x scripts/create-dmg.sh
 
           # Determine binary names
-          TRAY_BINARY="mcpproxy-tray"
           CORE_BINARY="mcpproxy"
 
-          # Create DMG with both tray and core binaries
-          ./scripts/create-dmg.sh ${TRAY_BINARY} ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          # Use Swift app for DMG when available, fall back to Go tray binary
+          if [ -n "$SWIFT_APP_PATH" ] && [ -d "$SWIFT_APP_PATH" ]; then
+            echo "Using Swift app bundle for DMG: $SWIFT_APP_PATH"
+            ./scripts/create-dmg.sh "$SWIFT_APP_PATH" ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          else
+            echo "Using Go tray binary for DMG"
+            TRAY_BINARY="mcpproxy-tray"
+            ./scripts/create-dmg.sh ${TRAY_BINARY} ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          fi
 
           # Sign DMG
           DMG_NAME="mcpproxy-${VERSION#v}-darwin-${{ matrix.goarch }}.dmg"
@@ -734,9 +764,9 @@ jobs:
         if: matrix.goos == 'darwin'
         env:
           # Ensure PKG creation also uses correct deployment target
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
-          CGO_CFLAGS: "-mmacosx-version-min=12.0"
-          CGO_LDFLAGS: "-mmacosx-version-min=12.0"
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+          CGO_CFLAGS: "-mmacosx-version-min=13.0"
+          CGO_LDFLAGS: "-mmacosx-version-min=13.0"
         run: |
           VERSION=${GITHUB_REF#refs/tags/}
           chmod +x scripts/create-pkg.sh
@@ -784,12 +814,18 @@ jobs:
           export PKG_CERT_IDENTITY
 
           # Determine binary names
-          TRAY_BINARY="mcpproxy-tray"
           CORE_BINARY="mcpproxy"
 
-          # Create PKG installer with both tray and core binaries
+          # Use Swift app for PKG when available, fall back to Go tray binary
           echo "Creating signed PKG installer with certificate: ${PKG_CERT_IDENTITY}"
-          ./scripts/create-pkg.sh ${TRAY_BINARY} ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          if [ -n "$SWIFT_APP_PATH" ] && [ -d "$SWIFT_APP_PATH" ]; then
+            echo "Using Swift app bundle for PKG: $SWIFT_APP_PATH"
+            ./scripts/create-pkg.sh "$SWIFT_APP_PATH" ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          else
+            echo "Using Go tray binary for PKG"
+            TRAY_BINARY="mcpproxy-tray"
+            ./scripts/create-pkg.sh ${TRAY_BINARY} ${CORE_BINARY} ${VERSION} ${{ matrix.goarch }}
+          fi
 
           # Create installer DMG containing the PKG
           PKG_NAME="mcpproxy-${VERSION#v}-darwin-${{ matrix.goarch }}.pkg"
@@ -1042,6 +1078,13 @@ jobs:
             cp "$file" "release-files/$filename"
           done
 
+          # Copy Linux .deb and .rpm packages
+          find dist -path "*/linux-packages-*" \( -name "*.deb" -o -name "*.rpm" \) | while read pkg_file; do
+            filename=$(basename "$pkg_file")
+            echo "Found Linux package: $filename"
+            cp "$pkg_file" "release-files/$filename"
+          done
+
           # Copy Windows installer files (.exe)
           find dist -path "*/installer-windows-*" -name "*.exe" | while read installer_file; do
             filename=$(basename "$installer_file")
@@ -1116,8 +1159,12 @@ jobs:
             | **macOS (Intel)** | [**Download DMG**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-${{ env.CLEAN_VERSION }}-darwin-amd64-installer.dmg) | Signed & Notarized |
             | **Windows (64-bit)** | [**Download Setup**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-setup-${{ github.ref_name }}-amd64.exe) | Setup wizard |
             | **Windows (ARM64)** | [**Download Setup**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-setup-${{ github.ref_name }}-arm64.exe) | For ARM Windows devices |
-            | **Linux (AMD64)** | [**Download tar.gz**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-${{ env.CLEAN_VERSION }}-linux-amd64.tar.gz) | Binary package |
-            | **Linux (ARM64)** | [**Download tar.gz**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-${{ env.CLEAN_VERSION }}-linux-arm64.tar.gz) | For ARM Linux |
+            | **Linux Debian/Ubuntu (AMD64)** | [**Download .deb**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy_${{ env.CLEAN_VERSION }}_amd64.deb) | `sudo apt install ./mcpproxy_*.deb` |
+            | **Linux Debian/Ubuntu (ARM64)** | [**Download .deb**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy_${{ env.CLEAN_VERSION }}_arm64.deb) | For ARM64 (Raspberry Pi etc.) |
+            | **Linux Fedora/RHEL (AMD64)** | [**Download .rpm**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-${{ env.CLEAN_VERSION }}-1.x86_64.rpm) | `sudo dnf install ./mcpproxy-*.rpm` |
+            | **Linux Fedora/RHEL (ARM64)** | [**Download .rpm**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-${{ env.CLEAN_VERSION }}-1.aarch64.rpm) | For ARM64 |
+            | **Linux (AMD64) — tarball** | [**Download tar.gz**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-${{ env.CLEAN_VERSION }}-linux-amd64.tar.gz) | Binary only |
+            | **Linux (ARM64) — tarball** | [**Download tar.gz**](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mcpproxy-${{ env.CLEAN_VERSION }}-linux-arm64.tar.gz) | Binary only |
 
             **Homebrew (macOS/Linux):**
             ```bash
@@ -1320,12 +1367,63 @@ jobs:
           echo "Formula created successfully:"
           cat Formula/mcpproxy.rb
 
+      - name: Download installer DMGs and calculate SHA256 for cask
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
+
+          for ARCH in arm64 amd64; do
+            DMG="mcpproxy-${VERSION}-darwin-${ARCH}-installer.dmg"
+            URL="${BASE_URL}/${DMG}"
+            echo "Downloading ${DMG}..."
+            for i in {1..5}; do
+              echo "  Attempt ${i}/5..."
+              if curl -fsSL "${URL}" -o "${DMG}"; then
+                echo "  Download successful"
+                break
+              else
+                echo "  Download failed, retrying in 10 seconds..."
+                sleep 10
+              fi
+              if [ $i -eq 5 ]; then
+                echo "All download attempts failed for ${DMG}"
+                curl -I "${URL}" || true
+                exit 1
+              fi
+            done
+            SHA=$(sha256sum "${DMG}" | cut -d' ' -f1)
+            VAR_NAME="SHA256_CASK_$(echo ${ARCH} | tr '[:lower:]' '[:upper:]')"
+            echo "${VAR_NAME}=${SHA}" >> $GITHUB_ENV
+            echo "  SHA256: ${SHA}"
+            rm -f "${DMG}"
+          done
+
+      - name: Update Homebrew cask
+        run: |
+          cd tap
+          mkdir -p Casks
+          CASK_FILE="Casks/mcpproxy.rb"
+
+          if [ ! -f "${CASK_FILE}" ]; then
+            echo "Cask file not found at ${CASK_FILE}, skipping cask update"
+            exit 0
+          fi
+
+          # Bump version and both sha256 values in place
+          sed -i "s/version \"[^\"]*\"/version \"${VERSION}\"/" "${CASK_FILE}"
+          # arm64 sha256 is the first occurrence, amd64 is the second
+          sed -i "0,/sha256 \"[^\"]*\"/{s/sha256 \"[^\"]*\"/sha256 \"${SHA256_CASK_ARM64}\"/}" "${CASK_FILE}"
+          sed -i "0,/sha256 \"${SHA256_CASK_ARM64}\"/{b}; s/sha256 \"[^\"]*\"/sha256 \"${SHA256_CASK_AMD64}\"/" "${CASK_FILE}"
+
+          echo "Cask updated:"
+          cat "${CASK_FILE}"
+
       - name: Commit and push changes
         run: |
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/mcpproxy.rb
+          git add Formula/mcpproxy.rb Casks/mcpproxy.rb
 
           # Check if there are changes to commit
           if git diff --staged --quiet; then
@@ -1335,6 +1433,59 @@ jobs:
             git push
             echo "Changes committed and pushed successfully"
           fi
+
+  # Publish signed apt/yum repositories to Cloudflare R2 (apt.mcpproxy.app, rpm.mcpproxy.app)
+  publish-linux-repos:
+    needs: [build, release]
+    # Stable channel only: skip pre-release tags (v*-rc1, v*-beta, etc.)
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && github.repository == 'smart-mcp-proxy/mcpproxy-go'
+    runs-on: ubuntu-latest
+    environment: production
+
+    env:
+      APT_BUCKET: mcpproxy-apt
+      RPM_BUCKET: mcpproxy-rpm
+      APT_BASE_URL: https://apt.mcpproxy.app
+      RPM_BASE_URL: https://rpm.mcpproxy.app
+      GPG_KEY_ID: ${{ vars.PACKAGES_GPG_KEY_ID }}
+      RETAIN_N: "10"
+      AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      AWS_DEFAULT_REGION: auto
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      PACKAGES_GPG_PRIVATE_KEY: ${{ secrets.PACKAGES_GPG_PRIVATE_KEY }}
+      PACKAGES_GPG_PASSPHRASE: ${{ secrets.PACKAGES_GPG_PASSPHRASE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install repo tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apt-utils createrepo-c gnupg rpm
+          aws --version
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: linux-packages-*
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Contents of release-artifacts:"
+          find release-artifacts -type f | sort
+
+      - name: Publish apt + rpm repositories to R2
+        run: contrib/linux-repos/publish.sh release-artifacts
+
+      - name: Smoke-test install (Debian)
+        run: contrib/linux-repos/smoke-test-debian.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Smoke-test install (Fedora)
+        run: contrib/linux-repos/smoke-test-fedora.sh "${GITHUB_REF_NAME#v}"
 
   # Deploy documentation to Cloudflare Pages
   deploy-docs:
