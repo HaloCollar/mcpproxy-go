@@ -151,7 +151,7 @@ func (r *Runtime) enforceInvariant(serverName, toolName, oldStatus, newStatus st
 
 // ToolApprovalResult contains the result of checking tool approvals for a server.
 type ToolApprovalResult struct {
-	// BlockedTools is the set of tool names that should not be indexed (pending or changed).
+	// BlockedTools is the set of tool names that should not be indexed (pending, changed, or disabled).
 	BlockedTools map[string]bool
 	// PendingCount is the number of newly discovered tools awaiting approval.
 	PendingCount int
@@ -285,6 +285,10 @@ func (r *Runtime) checkToolApprovals(serverName string, tools []*config.ToolMeta
 				"", tool.Description, "", schemaJSON)
 
 			continue
+		}
+
+		if existing.Disabled {
+			result.BlockedTools[toolName] = true
 		}
 
 		// Existing record found - check if hash matches
@@ -601,6 +605,43 @@ func (r *Runtime) ApproveTools(serverName string, toolNames []string, approvedBy
 		r.emitToolQuarantineEvent(serverName, toolName, "tool_approved",
 			"", record.ApprovedHash, "", record.CurrentDescription, "", record.CurrentSchema)
 	}
+
+	return nil
+}
+
+// SetToolEnabled sets whether a tool is enabled for exposure to MCP clients.
+func (r *Runtime) SetToolEnabled(serverName, toolName string, enabled bool, updatedBy string) error {
+	if r.storageManager == nil {
+		return nil
+	}
+
+	record, err := r.storageManager.GetToolApproval(serverName, toolName)
+	if err != nil {
+		return err
+	}
+
+	record.Disabled = !enabled
+
+	if err := r.storageManager.SaveToolApproval(record); err != nil {
+		return err
+	}
+
+	action := "tool_enabled"
+	if !enabled {
+		action = "tool_disabled"
+	}
+
+	r.emitToolQuarantineEvent(serverName, toolName, action,
+		record.ApprovedHash, record.CurrentHash,
+		"", record.CurrentDescription,
+		"", record.CurrentSchema)
+
+	r.emitServersChanged(action, map[string]any{
+		"server":     serverName,
+		"tool":       toolName,
+		"enabled":    enabled,
+		"updated_by": updatedBy,
+	})
 
 	return nil
 }
