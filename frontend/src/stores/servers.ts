@@ -47,23 +47,26 @@ export const useServersStore = defineStore('servers', () => {
       const existingServer = existingMap.get(incomingServer.name)
 
       if (existingServer) {
-        // Update existing server in-place (preserves object reference)
-        // Only update properties that have changed
-        let hasChanges = false
-
-        // IMPORTANT: Clear last_error if not present in incoming server
-        // Object.assign won't clear properties that are missing from source
-        if (!('last_error' in incomingServer) && existingServer.last_error) {
-          delete existingServer.last_error
-          hasChanges = true
+        // Update existing server in-place (preserves object reference so
+        // ServerCard's v-memo / consumers' computeds keep their identity).
+        //
+        // CRITICAL: the API response is authoritative — any field absent on
+        // the incoming server has been cleared on the backend and must be
+        // dropped from the existing reactive object. Object.assign alone
+        // would leak a stale `quarantine: { pending_count: 5 }` (and other
+        // conditionally-emitted fields) after the user approves all tools,
+        // because the backend stops emitting the field when its count hits
+        // zero (see internal/httpapi/server.go enrichServersWithQuarantineStats).
+        // This was the root cause of issue #438.
+        const existingKeys = Object.keys(existingServer) as (keyof Server)[]
+        const incomingKeys = new Set(Object.keys(incomingServer))
+        for (const key of existingKeys) {
+          if (!incomingKeys.has(key)) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            delete (existingServer as any)[key]
+          }
         }
-
         Object.assign(existingServer, incomingServer)
-        hasChanges = true
-
-        if (hasChanges) {
-          console.log(`Server ${existingServer.name} updated with changes`)
-        }
 
         result.push(existingServer)
       } else {
@@ -361,6 +364,16 @@ export const useServersStore = defineStore('servers', () => {
   function handleServersChanged(event: Event) {
     const customEvent = event as CustomEvent
     console.log('Servers changed event received, updating in background...', customEvent.detail)
+
+    // Spec 047: when the SSE payload includes the full server list, consume it
+    // directly and skip the GET /api/v1/servers refetch. Fall back to refetch
+    // when running against an older core that publishes notify-only events.
+    const payload = customEvent.detail?.payload
+    if (payload && Array.isArray(payload.servers)) {
+      servers.value = mergeServers(servers.value, payload.servers as Server[])
+      return
+    }
+
     // Silent background refresh to avoid scroll jumps and loading states
     fetchServers(true)
   }

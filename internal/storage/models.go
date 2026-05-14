@@ -34,7 +34,38 @@ const (
 	ScanJobsBucket           = "security_scan_jobs"
 	ScanReportsBucket        = "security_reports"
 	IntegrityBaselinesBucket = "integrity_baselines"
+
+	// Onboarding wizard bucket (Spec 046)
+	OnboardingBucket = "onboarding"
 )
+
+// Onboarding state keys (Spec 046)
+const (
+	OnboardingStateKey = "wizard_state"
+)
+
+// OnboardingState records whether the user has engaged with the first-run
+// wizard, and which steps they completed or skipped. Persisted under
+// OnboardingBucket / OnboardingStateKey. Absence of the record means
+// "wizard has never been shown to this installation".
+type OnboardingState struct {
+	// Engaged is true once the wizard was shown and the user completed or
+	// skipped it. Once true, the wizard does not auto-show again, even if
+	// state regresses (e.g. user disconnects all clients).
+	Engaged bool `json:"engaged"`
+
+	// FirstShownAt is the timestamp of first wizard render.
+	FirstShownAt *time.Time `json:"first_shown_at,omitempty"`
+
+	// EngagedAt is the timestamp of completion or explicit skip.
+	EngagedAt *time.Time `json:"engaged_at,omitempty"`
+
+	// ConnectStepStatus is one of: "", "completed", "skipped".
+	ConnectStepStatus string `json:"connect_step_status,omitempty"`
+
+	// ServerStepStatus is one of: "", "completed", "skipped".
+	ServerStepStatus string `json:"server_step_status,omitempty"`
+}
 
 // Meta keys
 const (
@@ -47,22 +78,23 @@ const CurrentSchemaVersion = 2
 
 // UpstreamRecord represents an upstream server record in storage
 type UpstreamRecord struct {
-	ID             string                  `json:"id"`
-	Name           string                  `json:"name"`
-	URL            string                  `json:"url,omitempty"`
-	Protocol       string                  `json:"protocol,omitempty"` // stdio, http, sse, streamable-http, auto
-	Command        string                  `json:"command,omitempty"`
-	Args           []string                `json:"args,omitempty"`
-	WorkingDir     string                  `json:"working_dir,omitempty"` // Working directory for stdio servers
-	Env            map[string]string       `json:"env,omitempty"`
-	Headers        map[string]string       `json:"headers,omitempty"` // For HTTP authentication
-	OAuth          *config.OAuthConfig     `json:"oauth,omitempty"`   // OAuth configuration
-	Enabled        bool                    `json:"enabled"`
-	Quarantined    bool                    `json:"quarantined"` // Security quarantine status
-	Created        time.Time               `json:"created"`
-	Updated        time.Time               `json:"updated"`
-	Isolation      *config.IsolationConfig `json:"isolation,omitempty"`        // Per-server isolation settings
-	ReconnectOnUse bool                    `json:"reconnect_on_use,omitempty"` // Attempt reconnection on tool call
+	ID                  string                  `json:"id"`
+	Name                string                  `json:"name"`
+	URL                 string                  `json:"url,omitempty"`
+	Protocol            string                  `json:"protocol,omitempty"` // stdio, http, sse, streamable-http, auto
+	Command             string                  `json:"command,omitempty"`
+	Args                []string                `json:"args,omitempty"`
+	WorkingDir          string                  `json:"working_dir,omitempty"` // Working directory for stdio servers
+	Env                 map[string]string       `json:"env,omitempty"`
+	Headers             map[string]string       `json:"headers,omitempty"` // For HTTP authentication
+	OAuth               *config.OAuthConfig     `json:"oauth,omitempty"`   // OAuth configuration
+	Enabled             bool                    `json:"enabled"`
+	Quarantined         bool                    `json:"quarantined"` // Security quarantine status
+	Created             time.Time               `json:"created"`
+	Updated             time.Time               `json:"updated"`
+	Isolation           *config.IsolationConfig `json:"isolation,omitempty"`             // Per-server isolation settings
+	ReconnectOnUse      bool                    `json:"reconnect_on_use,omitempty"`      // Attempt reconnection on tool call
+	LauncherWaitTimeout config.Duration         `json:"launcher_wait_timeout,omitempty"` // Spec 046: max wait for locally-launched HTTP/SSE upstream URL to become reachable
 }
 
 // ToolStatRecord represents tool usage statistics

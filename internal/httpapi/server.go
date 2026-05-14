@@ -130,6 +130,16 @@ type ServerController interface {
 	ApproveTools(serverName string, toolNames []string, approvedBy string) error
 	ApproveAllTools(serverName string, approvedBy string) (int, error)
 	GetToolApproval(serverName, toolName string) (*storage.ToolApprovalRecord, error)
+
+	// Onboarding wizard (Spec 046)
+	GetOnboardingState() (*storage.OnboardingState, error)
+	SaveOnboardingState(state *storage.OnboardingState) error
+
+	// Activation state (Spec 044) — read-only access used by the v2
+	// onboarding wizard's Verify tab to detect whether any MCP client has
+	// successfully called this mcpproxy. Returns FirstMCPClientEver and
+	// MCPClientsSeenEver from the activation bucket.
+	GetActivationFirstMCPClient() (firstEver bool, seen []string)
 }
 
 // Server provides HTTP API endpoints with chi router
@@ -630,6 +640,10 @@ func (s *Server) setupRoutes() {
 		r.Post("/connect/{client}", s.handleConnectClient)
 		r.Delete("/connect/{client}", s.handleDisconnectClient)
 
+		// Onboarding wizard (Spec 046)
+		r.Get("/onboarding/state", s.handleGetOnboardingState)
+		r.Post("/onboarding/mark", s.handleMarkOnboardingState)
+
 		// Security scanner management routes (Spec 039)
 		r.Route("/security", func(r chi.Router) {
 			r.Get("/scanners", s.handleListScanners)
@@ -1026,26 +1040,11 @@ func (s *Server) handleGetServers(w http.ResponseWriter, r *http.Request) {
 		// Enrich with quarantine stats
 		s.enrichServersWithQuarantineStats(serverValues)
 
-		// Enrich with security scan summary (Spec 039)
-		if s.securityController != nil {
-			for i := range serverValues {
-				if summary := s.securityController.GetScanSummary(r.Context(), serverValues[i].Name); summary != nil {
-					serverValues[i].SecurityScan = &contracts.SecurityScanSummary{
-						LastScanAt: summary.LastScanAt,
-						RiskScore:  summary.RiskScore,
-						Status:     summary.Status,
-					}
-					if summary.FindingCounts != nil {
-						serverValues[i].SecurityScan.FindingCounts = &contracts.FindingCounts{
-							Dangerous: summary.FindingCounts.Dangerous,
-							Warning:   summary.FindingCounts.Warning,
-							Info:      summary.FindingCounts.Info,
-							Total:     summary.FindingCounts.Total,
-						}
-					}
-				}
-			}
-		}
+		// SecurityScan is now populated by management.ListServers via the
+		// SecurityScanEnricher wired in internal/server.NewServerWithConfigPath.
+		// Keeping the enrichment there means REST and the SSE servers.changed
+		// embed (which goes through runtime.buildServersChangedPayload →
+		// ListServers) share one site and can't drift out of parity.
 
 		// Redact sensitive header values unless explicitly opted out via
 		// `reveal_secret_headers: true` in config. See config.Config field

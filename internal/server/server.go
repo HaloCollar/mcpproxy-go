@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	httppprof "net/http/pprof"
 	"os"
 	"path/filepath"
+	gruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -1715,6 +1717,25 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	if cfg := s.runtime.Config(); cfg != nil {
 		connectSvc := connect.NewService(cfg.Listen, cfg.APIKey)
 		httpAPIServer.SetConnectService(connectSvc)
+
+		// Spec 046: wire the onboarding-funnel provider on the telemetry
+		// service so each heartbeat carries connected-client count + IDs
+		// (from connect.Service) and wizard engagement + per-step status
+		// (from BBolt OnboardingState). nil-safe at every layer.
+		if ts := s.runtime.TelemetryService(); ts != nil {
+			ts.SetOnboardingProvider(func() *telemetry.OnboardingSnapshot {
+				snap := &telemetry.OnboardingSnapshot{
+					ConnectedClientCount: connectSvc.GetConnectedCount(),
+					ConnectedClientIDs:   connectSvc.GetConnectedIDs(),
+				}
+				if state, err := s.runtime.GetOnboardingState(); err == nil && state != nil {
+					snap.WizardEngaged = state.Engaged
+					snap.WizardConnectStep = state.ConnectStepStatus
+					snap.WizardServerStep = state.ServerStepStatus
+				}
+				return snap
+			})
+		}
 	}
 	// Wire security scanner service (Spec 039)
 	if sm := s.runtime.StorageManager(); sm != nil {
@@ -1735,6 +1756,15 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 		secService.SetSecretStore(&keyringSecretStore{resolver: secret.NewResolver()})
 		secService.CleanupStaleJobs()
 		httpAPIServer.SetSecurityController(secService)
+		// Plumb scan summaries through management.ListServers so the SSE
+		// servers.changed embed and REST GET /api/v1/servers share a single
+		// enrichment site. Without this, mergeServers on the Web UI strips
+		// security_scan from every server on every SSE delivery — same bug
+		// class as the pre-existing quarantine-stats staleness PR #463
+		// already fixes for Quarantine.
+		if mgmtSvc, ok := s.runtime.GetManagementService().(management.Service); ok && mgmtSvc != nil {
+			mgmtSvc.SetScanSummaryEnricher(&scanSummaryEnricherAdapter{scanner: secService})
+		}
 		s.securityScanner = secService
 	}
 	// Wire teams multi-user OAuth (no-op in personal edition)
@@ -1750,6 +1780,41 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 
 	s.logger.Info("Registered REST API endpoints", zap.Strings("api_endpoints", []string{"/api/v1/*", "/events"}))
 	s.logger.Info("Registered health endpoints", zap.Strings("health_endpoints", healthEndpoints))
+
+	// Debug / profiling endpoints (API-key gated). Block & mutex profiles
+	// default to off; we enable them when the route is hit so the running
+	// daemon stays zero-overhead until someone actively profiles.
+	pprofMux := http.NewServeMux()
+	pprofMux.HandleFunc("/debug/pprof/", httppprof.Index)
+	pprofMux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+	pprofMux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+	pprofMux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+	pprofMux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+	pprofGated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.runtime.Config()
+		if cfg == nil || cfg.APIKey == "" {
+			http.Error(w, "api key not configured", http.StatusUnauthorized)
+			return
+		}
+		token := r.Header.Get("X-API-Key")
+		if token == "" {
+			token = r.URL.Query().Get("apikey")
+		}
+		if token == "" {
+			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+				token = strings.TrimPrefix(h, "Bearer ")
+			}
+		}
+		if token != cfg.APIKey {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		gruntime.SetBlockProfileRate(100_000_000) // 1 sample / 100 ms blocked
+		gruntime.SetMutexProfileFraction(100)     // sample 1% of contention
+		pprofMux.ServeHTTP(w, r)
+	})
+	mux.Handle("/debug/pprof/", pprofGated)
+	s.logger.Info("Registered pprof endpoints", zap.String("path", "/debug/pprof/"))
 
 	// Swagger UI (OpenAPI documentation) - mounted directly on main mux for /swagger/* access
 	swaggerHandler := httpapi.SetupSwaggerHandler(s.logger.Sugar())
@@ -2439,6 +2504,27 @@ func (s *Server) GetToolApprovalStatus(serverName, toolName string) (string, err
 	return string(record.Status), nil
 }
 
+// GetOnboardingState returns the wizard engagement state (Spec 046).
+func (s *Server) GetOnboardingState() (*storage.OnboardingState, error) {
+	return s.runtime.GetOnboardingState()
+}
+
+// SaveOnboardingState persists the wizard engagement state (Spec 046).
+func (s *Server) SaveOnboardingState(state *storage.OnboardingState) error {
+	return s.runtime.SaveOnboardingState(state)
+}
+
+// GetActivationFirstMCPClient returns Spec 044's FirstMCPClientEver flag and
+// the capped list of recognized client names. Used by the v2 onboarding wizard
+// (Spec 046 v2) to drive the Verify tab. Nil-safe: when telemetry isn't wired
+// (e.g. CI/test) returns (false, nil).
+func (s *Server) GetActivationFirstMCPClient() (bool, []string) {
+	if s.runtime == nil {
+		return false, nil
+	}
+	return s.runtime.GetActivationFirstMCPClient()
+}
+
 // serverUnquarantinerAdapter adapts *Server to scanner.ServerUnquarantiner so
 // the security scanner service can unquarantine a server after ApproveServer
 // succeeds. Reuses the existing Server.UnquarantineServer path so the behavior
@@ -2452,6 +2538,39 @@ func (a *serverUnquarantinerAdapter) UnquarantineServer(serverName string) error
 		return fmt.Errorf("server unavailable")
 	}
 	return a.server.UnquarantineServer(serverName)
+}
+
+// scanSummaryEnricherAdapter bridges scanner.Service.GetScanSummary (which
+// returns the scanner-internal *scanner.ScanSummary type) to
+// management.SecurityScanEnricher (which returns the wire-shape
+// *contracts.SecurityScanSummary used by REST and SSE consumers). Plain
+// field copy — the two structs are isomorphic by design.
+type scanSummaryEnricherAdapter struct {
+	scanner *scanner.Service
+}
+
+func (a *scanSummaryEnricherAdapter) GetSecurityScanSummary(ctx context.Context, serverName string) *contracts.SecurityScanSummary {
+	if a == nil || a.scanner == nil {
+		return nil
+	}
+	summary := a.scanner.GetScanSummary(ctx, serverName)
+	if summary == nil {
+		return nil
+	}
+	out := &contracts.SecurityScanSummary{
+		LastScanAt: summary.LastScanAt,
+		RiskScore:  summary.RiskScore,
+		Status:     summary.Status,
+	}
+	if summary.FindingCounts != nil {
+		out.FindingCounts = &contracts.FindingCounts{
+			Dangerous: summary.FindingCounts.Dangerous,
+			Warning:   summary.FindingCounts.Warning,
+			Info:      summary.FindingCounts.Info,
+			Total:     summary.FindingCounts.Total,
+		}
+	}
+	return out
 }
 
 // keyringSecretStore adapts secret.Resolver to scanner.SecretStore for API key management.

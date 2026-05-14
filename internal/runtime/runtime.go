@@ -84,12 +84,22 @@ type Runtime struct {
 	managementService interface{}           // Initialized later to avoid import cycle
 	activityService   *ActivityService      // Activity logging service
 
+	// Spec 047: coalesces servers.changed bursts and embeds the server list +
+	// stats payload so SSE subscribers can update without a follow-up
+	// GET /api/v1/servers.
+	coalescer *serversChangedCoalescer
+
 	// Phase 6: Supervisor for state reconciliation (lock-free reads via StateView)
 	supervisor *supervisor.Supervisor
 
 	// Tool discovery deduplication: tracks servers with in-progress reactive discovery
 	// Key: serverName, Value: struct{} (presence indicates discovery in progress)
 	discoveryInProgress sync.Map
+
+	// Last-good tool snapshots per server used to avoid transient tool loss during
+	// global discovery races/restarts.
+	lastGoodToolsMu sync.RWMutex
+	lastGoodTools   map[string][]*config.ToolMetadata
 
 	// Schema v3 (telemetry): time-cached Docker daemon availability. The
 	// probe has a 2s `docker info` cost, so we don't want to run it on every
@@ -244,10 +254,16 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 			Message:     "Runtime is initializing...",
 			LastUpdated: time.Now(),
 		},
-		statusCh:     make(chan Status, 10),
-		eventSubs:    make(map[chan Event]struct{}),
-		phaseMachine: newPhaseMachine(PhaseInitializing),
+		statusCh:      make(chan Status, 10),
+		eventSubs:     make(map[chan Event]struct{}),
+		phaseMachine:  newPhaseMachine(PhaseInitializing),
+		lastGoodTools: make(map[string][]*config.ToolMetadata),
 	}
+
+	// Spec 047: drainer goroutine that publishes coalesced servers.changed
+	// events. Lifetime is tied to appCtx so it shuts down with the runtime.
+	rt.coalescer = newServersChangedCoalescer(rt, 50*time.Millisecond)
+	rt.coalescer.start(appCtx)
 
 	return rt, nil
 }
@@ -2152,6 +2168,22 @@ func (r *Runtime) SetTelemetry(version, edition string) {
 					r.logger.Info("Installer-launched process: installer_heartbeat_pending=true")
 				}
 			}
+
+			// Spec 044 Phase H: wire diagnostics counter store. Pre-create the
+			// bucket to avoid write-race on first DiagnosticError classification.
+			if err := telemetry.EnsureDiagnosticsCountersBucket(db); err != nil {
+				r.logger.Warn("Failed to ensure diagnostics_counters bucket", zap.Error(err))
+			}
+			diagStore := telemetry.NewDiagnosticsCounterStore()
+			r.telemetryService.SetDiagnosticsCounterStore(diagStore, db)
+
+			// Wire error-code notifier into supervisor so every classified
+			// DiagnosticError increments the 24h per-code counter.
+			if r.supervisor != nil {
+				r.supervisor.SetErrorCodeNotifier(func(code string) {
+					_ = diagStore.RecordErrorCode(db, code)
+				})
+			}
 		}
 	}
 
@@ -2441,4 +2473,42 @@ func (r *Runtime) GetToolApproval(serverName, toolName string) (*storage.ToolApp
 		return nil, fmt.Errorf("storage not available")
 	}
 	return r.storageManager.GetToolApproval(serverName, toolName)
+}
+
+// GetOnboardingState returns the current wizard engagement state (Spec 046).
+func (r *Runtime) GetOnboardingState() (*storage.OnboardingState, error) {
+	if r.storageManager == nil {
+		return &storage.OnboardingState{}, nil
+	}
+	return r.storageManager.GetOnboardingState()
+}
+
+// GetActivationFirstMCPClient returns Spec 044's FirstMCPClientEver flag and
+// the capped list of recognized client names from the activation bucket. Used
+// by the v2 onboarding wizard (Spec 046 v2) Verify tab. Nil-safe: when
+// telemetry/activation isn't wired (CI/test or telemetry disabled) returns
+// (false, nil).
+func (r *Runtime) GetActivationFirstMCPClient() (bool, []string) {
+	if r.telemetryService == nil {
+		return false, nil
+	}
+	store := r.telemetryService.ActivationStore()
+	db := r.telemetryService.ActivationDB()
+	if store == nil || db == nil {
+		return false, nil
+	}
+	st, err := store.Load(db)
+	if err != nil {
+		r.logger.Debug("activation: Load failed for onboarding verify", zap.Error(err))
+		return false, nil
+	}
+	return st.FirstMCPClientEver, st.MCPClientsSeenEver
+}
+
+// SaveOnboardingState persists the wizard engagement state (Spec 046).
+func (r *Runtime) SaveOnboardingState(state *storage.OnboardingState) error {
+	if r.storageManager == nil {
+		return fmt.Errorf("storage not available")
+	}
+	return r.storageManager.SaveOnboardingState(state)
 }
