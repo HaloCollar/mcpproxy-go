@@ -160,6 +160,11 @@ export interface Server {
   protocol: 'http' | 'stdio' | 'streamable-http'
   enabled: boolean
   quarantined: boolean
+  // Per-upstream scope tags (Option B). Empty/undefined means the server is
+  // "general" and visible to every client session; tagged servers are only
+  // visible to sessions whose `?tags=` scope intersects these. Shown as chips
+  // on the servers list.
+  tags?: string[]
   // Per-server intent to auto-approve tool changes/additions (MCP-2930).
   // When true, rug-pull protection is disabled for this server: changed and
   // newly-added tools are trusted automatically instead of held for review.

@@ -253,6 +253,16 @@ func MergeServerConfig(base, patch *ServerConfig, opts MergeOptions) (*ServerCon
 		copy(merged.Args, patch.Args)
 	}
 
+	// Tags (Option B) - replace entirely if provided in patch. A non-nil patch
+	// slice replaces the tag set; nil leaves the existing tags untouched.
+	if patch.Tags != nil {
+		if diff != nil && !reflect.DeepEqual(base.Tags, patch.Tags) {
+			diff.Modified["tags"] = FieldChange{Path: "tags", From: base.Tags, To: patch.Tags}
+		}
+		merged.Tags = make([]string, len(patch.Tags))
+		copy(merged.Tags, patch.Tags)
+	}
+
 	// Map fields - deep merge with RFC 7396 null-means-remove support
 	envRemovalKeys := opts.GetRemoveMarkersForMap("env")
 	if patch.Env != nil || len(envRemovalKeys) > 0 {
@@ -546,6 +556,11 @@ func CopyServerConfig(src *ServerConfig) *ServerConfig {
 	if src.Args != nil {
 		dst.Args = make([]string, len(src.Args))
 		copy(dst.Args, src.Args)
+	}
+	// Preserve tags (Option B) across a merge that doesn't touch them.
+	if src.Tags != nil {
+		dst.Tags = make([]string, len(src.Tags))
+		copy(dst.Tags, src.Tags)
 	}
 
 	// Copy maps

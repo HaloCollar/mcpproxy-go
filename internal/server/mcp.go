@@ -30,6 +30,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server/tokens"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tagscope"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/truncate"
@@ -710,6 +711,9 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 			mcp.WithString("oauth_json",
 				mcp.Description("OAuth config as JSON object. MERGES with existing settings. Use 'null' to remove OAuth entirely. Fields: client_id, client_secret, scopes (array - replaces)."),
 			),
+			mcp.WithString("tags_json",
+				mcp.Description("Upstream tags as a JSON array of strings, e.g. '[\"halo\",\"personal\"]'. Tags scope the server to client sessions: an untagged server is visible to all clients; a tagged server is only visible to sessions that request an intersecting scope via the /mcp endpoint's `?tags=` query. On add/update this REPLACES the tag set. If require_server_tags is enabled, add requires at least one tag."),
+			),
 			mcp.WithBoolean("enabled",
 				mcp.Description("Whether server should be enabled (default: true)"),
 			),
@@ -1149,6 +1153,9 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	enforceAgentScope := authCtx != nil && !authCtx.IsAdmin()
 	// Spec 057: profile scope filter — independent of agent-scope (nil = allow all).
 	profileScope := profile.ProfileScopeFromContext(ctx)
+	// Option B: per-session tag scope filter — resolved from the `?tags=` query
+	// on the /mcp endpoint. nil = no scope declared = allow all (backward compat).
+	tagScope := tagscope.TagScopeFromContext(ctx)
 
 	// Spec 049: opt-in discovery of locked tools. When false (default) the
 	// behavior below is byte-for-byte identical to before — disabled tools are
@@ -1183,6 +1190,11 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		// Spec 057: profile filter — runs independently of agent-scope so that
 		// unauthenticated /mcp/p/<slug> connections (AdminContext) are still filtered.
 		if !profileScope.Allows(serverName) {
+			continue
+		}
+		// Option B: per-session tag scope filter — out-of-scope servers are
+		// absent from retrieve_tools results (nil scope = allow all).
+		if !tagScope.Allows(serverName) {
 			continue
 		}
 
@@ -1572,6 +1584,14 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// unauthenticated /mcp/p/<slug> connections (AdminContext) are still filtered.
 	if profileScope := profile.ProfileScopeFromContext(ctx); profileScope != nil && !profileScope.Allows(serverName) {
 		errMsg := fmt.Sprintf("server '%s' is not in profile '%s'", serverName, profileScope.Name)
+		p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
+	}
+
+	// Option B: per-session tag scope filter — refuse out-of-scope servers with
+	// a clear error. nil scope (no `?tags=` declared) allows everything.
+	if tagScope := tagscope.TagScopeFromContext(ctx); tagScope != nil && !tagScope.Allows(serverName) {
+		errMsg := fmt.Sprintf("server '%s' is out of scope for this session (session tags: %s)", serverName, tagScope.TagsString())
 		p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", errMsg)
 		return mcp.NewToolResultError(errMsg), nil
 	}
@@ -2887,6 +2907,18 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 		servers = filtered
 	}
 
+	// Option B: filter to servers visible in the active per-session tag scope so
+	// an out-of-scope server never appears in `upstream_servers list` either.
+	if tagScope := tagscope.TagScopeFromContext(ctx); tagScope != nil {
+		var filtered []*config.ServerConfig
+		for _, s := range servers {
+			if tagScope.Allows(s.Name) {
+				filtered = append(filtered, s)
+			}
+		}
+		servers = filtered
+	}
+
 	// Check Docker availability only if Docker isolation is globally enabled
 	dockerIsolationGlobalEnabled := p.config.DockerIsolation != nil && p.config.DockerIsolation.Enabled
 	var dockerAvailable bool
@@ -2920,6 +2952,9 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 			"quarantined": server.Quarantined,
 			"created":     server.Created,
 			"updated":     server.Updated,
+		}
+		if len(server.Tags) > 0 {
+			serverMap["tags"] = server.Tags
 		}
 
 		// Add connection status information and calculate health
@@ -3741,6 +3776,40 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		oauth = &oauthConfig
 	}
 
+	// Handle tags: accept either tags_json (a JSON array string) or a native
+	// `tags` array in the arguments. Option B — per-upstream tags/scopes.
+	var tags []string
+	if tagsJSON := request.GetString("tags_json", ""); tagsJSON != "" {
+		if err := json.Unmarshal([]byte(tagsJSON), &tags); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid tags_json format: %v", err)), nil
+		}
+	}
+	if tags == nil && request.Params.Arguments != nil {
+		if argumentsMap, ok := request.Params.Arguments.(map[string]interface{}); ok {
+			if tagsParam, ok := argumentsMap["tags"]; ok {
+				if tagsList, ok := tagsParam.([]interface{}); ok {
+					for _, t := range tagsList {
+						if tStr, ok := t.(string); ok {
+							tags = append(tags, tStr)
+						}
+					}
+				}
+			}
+		}
+	}
+	tags = config.NormalizeTags(tags)
+
+	// Enforce require_server_tags: reject an untagged add when the policy is on.
+	requireTags := false
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		if cfg := p.mainServer.runtime.Config(); cfg != nil {
+			requireTags = cfg.RequireServerTags
+		}
+	}
+	if err := config.ValidateServerTagRequirement(requireTags, name, tags); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	// Auto-detect protocol
 	protocol := request.GetString("protocol", "")
 	if protocol == "" {
@@ -3767,6 +3836,7 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		Created:     time.Now(),
 		Isolation:   isolation,
 		OAuth:       oauth,
+		Tags:        tags,
 	}
 
 	// Save to storage
@@ -3847,6 +3917,9 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		"connection_status":  connectionStatus,
 		"connection_message": connectionMessage,
 		"quarantined":        quarantined,
+	}
+	if len(tags) > 0 {
+		responseMap["tags"] = tags
 	}
 
 	if len(dockerWarnings) > 0 {
@@ -4270,6 +4343,26 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 				return nil, opts, fmt.Errorf("invalid oauth_json format: %v", err)
 			}
 			patch.OAuth = &oauth
+		}
+	}
+
+	// Handle tags JSON string (Option B) - array replaced entirely if provided.
+	// A non-empty JSON array replaces the tag set; "[]" or "null" clears tags.
+	if tagsJSON := request.GetString("tags_json", ""); tagsJSON != "" {
+		if tagsJSON == "null" {
+			// Explicit clear: an empty (non-nil) slice replaces the tag set.
+			patch.Tags = []string{}
+		} else {
+			var tags []string
+			if err := json.Unmarshal([]byte(tagsJSON), &tags); err != nil {
+				return nil, opts, fmt.Errorf("invalid tags_json format: %v", err)
+			}
+			// Normalize but keep non-nil so the merge treats it as an explicit
+			// replacement (nil would mean "leave tags untouched").
+			patch.Tags = config.NormalizeTags(tags)
+			if patch.Tags == nil {
+				patch.Tags = []string{}
+			}
 		}
 	}
 

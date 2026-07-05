@@ -87,6 +87,29 @@ func getStringArrayField(m map[string]interface{}, key string) []string {
 	return nil
 }
 
+// getStringSliceField reads a string slice that may be stored either as a
+// native []string (in-process config map) or a []interface{} (after a JSON
+// round-trip from the daemon). Returns nil when absent or the wrong type.
+func getStringSliceField(m map[string]interface{}, key string) []string {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil
+	}
+	switch arr := v.(type) {
+	case []string:
+		return arr
+	case []interface{}:
+		result := make([]string, 0, len(arr))
+		for _, item := range arr {
+			if str, ok := item.(string); ok {
+				result = append(result, str)
+			}
+		}
+		return result
+	}
+	return nil
+}
+
 func getMapField(m map[string]interface{}, key string) map[string]interface{} {
 	if v, ok := m[key]; ok && v != nil {
 		if mm, ok := v.(map[string]interface{}); ok {

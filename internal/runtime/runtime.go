@@ -1912,6 +1912,12 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 			serverMap["reconnect_on_use"] = true
 		}
 
+		// Option B: surface per-upstream tags so the REST GET payload (and the
+		// SSE servers.changed embed) can drive the Web UI tag chips.
+		if serverStatus.Config != nil && len(serverStatus.Config.Tags) > 0 {
+			serverMap["tags"] = serverStatus.Config.Tags
+		}
+
 		// MCP-2940: surface the per-server auto-approve intent so the REST GET
 		// payload (and SSE servers.changed embed) can drive the Web UI toggle.
 		// Tri-state *bool — only emit the key when set so the projection stays

@@ -25,6 +25,20 @@
         </div>
       </div>
 
+      <!-- Scope tags (Option B): a server with no tags is "general" and
+           visible to every client session; tagged servers are only visible to
+           sessions that request an intersecting scope via ?tags= on /mcp. -->
+      <div v-if="server.tags && server.tags.length > 0" class="flex flex-wrap gap-1 mb-4" data-test="server-tags">
+        <span
+          v-for="tag in server.tags"
+          :key="tag"
+          class="badge badge-outline badge-sm"
+          :title="`Scope tag: ${tag}`"
+        >
+          {{ tag }}
+        </span>
+      </div>
+
       <!-- Stats -->
       <div class="grid grid-cols-2 gap-4 mb-4">
         <div class="stat bg-base-200 rounded-lg p-3">
