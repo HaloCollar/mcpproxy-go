@@ -255,8 +255,21 @@ func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *
 			}
 		}
 
-		// Token is not authenticated yet (none status)
-		if input.OAuthStatus == "none" || input.OAuthStatus == "" {
+		// Token is not authenticated yet (none status). Gated on
+		// !(Connected && ToolCount > 0): a server that is actually
+		// Connected/Ready AND has listed tools is by definition already
+		// authenticated, regardless of whether the OAuth-status signal
+		// resolved cleanly — e.g. a token stored under an unexpected key,
+		// auth via a non-OAuth mechanism (static headers) alongside a
+		// present-but-unused OAuth config, or a transient token-store
+		// lookup failure. Without this guard those cases would show a
+		// false "Authentication required" verdict next to a working
+		// connection. A Connected server with zero tools listed (yet) is
+		// NOT covered by this guard — a bare connection alone doesn't prove
+		// authentication succeeded, so it still falls through to the
+		// "Authentication required" verdict below. MCP health-verdict
+		// staleness fix.
+		if (input.OAuthStatus == "none" || input.OAuthStatus == "") && !(input.Connected && input.ToolCount > 0) {
 			// Server requires OAuth but no token - needs login
 			return &contracts.HealthStatus{
 				Level:      LevelUnhealthy,

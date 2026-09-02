@@ -2993,6 +2993,26 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 			OAuthConfigErr: health.ExtractOAuthConfigError(lastError),
 		}
 
+		// Recompute OAuth status from the currently stored token (via the
+		// shared oauth.ResolveStatus + health.ApplyOAuth pairing, also used
+		// by Runtime.GetAllServers and the REST /api/v1/servers path)
+		// instead of leaving healthInput.OAuthStatus at its zero value
+		// (""), which CalculateHealth reads as "never authenticated" and
+		// reports as "Authentication required" — even once the server is
+		// Connected/Ready with tools listed. This clears a stale
+		// auth-required verdict left by an earlier failed/pending probe as
+		// soon as a later connection succeeds and persists a fresh token;
+		// ResolveStatus also ignores a stale LastError while the server is
+		// Connected.
+		if server.OAuth != nil {
+			var storageManager *storage.Manager
+			if p.mainServer != nil && p.mainServer.runtime != nil {
+				storageManager = p.mainServer.runtime.StorageManager()
+			}
+			result := oauth.ResolveStatus(storageManager, server.Name, server.URL, true, healthInput.Connected, healthInput.LastError)
+			health.ApplyOAuth(&healthInput, result)
+		}
+
 		// T032: Wire refresh state into health calculation (Spec 023)
 		if p.mainServer != nil && p.mainServer.runtime != nil {
 			if refreshMgr := p.mainServer.runtime.RefreshManager(); refreshMgr != nil {
