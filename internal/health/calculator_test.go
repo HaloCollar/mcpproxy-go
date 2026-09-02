@@ -5,8 +5,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 )
 
 func TestCalculateHealth_DisabledServer(t *testing.T) {
@@ -194,6 +192,31 @@ func TestCalculateHealth_OAuthNone(t *testing.T) {
 	assert.Equal(t, LevelUnhealthy, result.Level)
 	assert.Equal(t, "Authentication required", result.Summary)
 	assert.Equal(t, ActionLogin, result.Action)
+}
+
+// TestCalculateHealth_OAuthNoneButConnected verifies that a server which is
+// actually Connected/Ready and has listed tools is NOT reported as
+// "Authentication required" merely because OAuthStatus resolved to
+// none/empty — e.g. a token stored under an unexpected key, auth via a
+// non-OAuth mechanism (static headers) alongside a present-but-unused OAuth
+// config, or a transient token-store lookup failure. A working connection is
+// by definition already authenticated regardless of the OAuth-status signal
+// (review follow-up on 3dfeacec, item 3).
+func TestCalculateHealth_OAuthNoneButConnected(t *testing.T) {
+	input := HealthCalculatorInput{
+		Name:          "test-server",
+		Enabled:       true,
+		State:         "connected",
+		Connected:     true,
+		OAuthRequired: true,
+		OAuthStatus:   "none",
+		ToolCount:     34,
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.NotEqual(t, "Authentication required", result.Summary)
+	assert.Equal(t, LevelHealthy, result.Level)
 }
 
 // TestCalculateHealth_OAuthLoginRequired verifies that a server awaiting a
@@ -902,18 +925,8 @@ func TestFormatRefreshRetryDetail(t *testing.T) {
 	})
 }
 
-// TestRefreshStateSync ensures health.RefreshState values stay in sync with oauth.RefreshState.
-// The health package mirrors oauth.RefreshState for decoupling, but the values must match
-// for proper state mapping when wiring RefreshManager state into health calculation.
-func TestRefreshStateSync(t *testing.T) {
-	// Verify that the integer values match between health and oauth packages
-	// This test will fail if either package changes its constants without updating the other
-	assert.Equal(t, int(RefreshStateIdle), int(oauth.RefreshStateIdle),
-		"RefreshStateIdle values must match between health and oauth packages")
-	assert.Equal(t, int(RefreshStateScheduled), int(oauth.RefreshStateScheduled),
-		"RefreshStateScheduled values must match between health and oauth packages")
-	assert.Equal(t, int(RefreshStateRetrying), int(oauth.RefreshStateRetrying),
-		"RefreshStateRetrying values must match between health and oauth packages")
-	assert.Equal(t, int(RefreshStateFailed), int(oauth.RefreshStateFailed),
-		"RefreshStateFailed values must match between health and oauth packages")
-}
+// TestRefreshStateSync (comparing health.RefreshState* against
+// oauth.RefreshState*) moved to refresh_state_oauth_sync_test.go in the
+// external health_test package: internal/oauth now imports internal/health
+// (status.go's ApplyToHealthInput), so this internal (package health) test
+// file can no longer also import internal/oauth without an import cycle.

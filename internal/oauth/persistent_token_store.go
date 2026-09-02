@@ -56,12 +56,6 @@ func GenerateServerKey(serverName, serverURL string) string {
 	// Return first 16 characters of hash for readability (still highly unique)
 	key := fmt.Sprintf("%s_%s", serverName, hashStr[:16])
 
-	// Log key generation for debugging server key mismatches
-	zap.L().Debug("Generated OAuth server key",
-		zap.String("server_name", serverName),
-		zap.String("server_url", serverURL),
-		zap.String("generated_key", key))
-
 	return key
 }
 
