@@ -29,6 +29,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/httpapi"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/logs"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/management"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/observability"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/profile"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime"
@@ -849,6 +850,22 @@ func (s *Server) GetAllServers() ([]map[string]interface{}, error) {
 		// Check if OAuth is required for this server
 		if serverStatus.Config != nil && serverStatus.Config.OAuth != nil {
 			healthInput.OAuthRequired = true
+
+			// Recompute OAuth status from the currently stored token instead of
+			// leaving healthInput.OAuthStatus at its zero value (""), which
+			// CalculateHealth reads as "never authenticated" and reports as
+			// "Authentication required" — even once the server is
+			// Connected/Ready with tools listed. This clears a stale
+			// auth-required verdict left by an earlier failed/pending probe as
+			// soon as a later connection succeeds and persists a fresh token.
+			oauthStatus, hasRefreshToken, tokenExpiresAt := oauth.ResolveStatus(
+				s.runtime.StorageManager(), serverStatus.Name, url, serverStatus.LastError)
+			healthInput.OAuthStatus = oauthStatus.String()
+			healthInput.HasRefreshToken = hasRefreshToken
+			if !tokenExpiresAt.IsZero() {
+				expiresAt := tokenExpiresAt
+				healthInput.TokenExpiresAt = &expiresAt
+			}
 		}
 
 		// T032: Wire refresh state into health calculation (Spec 023)
