@@ -851,21 +851,18 @@ func (s *Server) GetAllServers() ([]map[string]interface{}, error) {
 		if serverStatus.Config != nil && serverStatus.Config.OAuth != nil {
 			healthInput.OAuthRequired = true
 
-			// Recompute OAuth status from the currently stored token instead of
-			// leaving healthInput.OAuthStatus at its zero value (""), which
-			// CalculateHealth reads as "never authenticated" and reports as
-			// "Authentication required" — even once the server is
+			// Recompute OAuth status from the currently stored token (via the
+			// shared oauth.ApplyToHealthInput/ResolveStatus, also used by
+			// Runtime.GetAllServers and the upstream_servers MCP tool)
+			// instead of leaving healthInput.OAuthStatus at its zero value
+			// (""), which CalculateHealth reads as "never authenticated" and
+			// reports "Authentication required" — even once the server is
 			// Connected/Ready with tools listed. This clears a stale
-			// auth-required verdict left by an earlier failed/pending probe as
-			// soon as a later connection succeeds and persists a fresh token.
-			oauthStatus, hasRefreshToken, tokenExpiresAt := oauth.ResolveStatus(
-				s.runtime.StorageManager(), serverStatus.Name, url, serverStatus.LastError)
-			healthInput.OAuthStatus = oauthStatus.String()
-			healthInput.HasRefreshToken = hasRefreshToken
-			if !tokenExpiresAt.IsZero() {
-				expiresAt := tokenExpiresAt
-				healthInput.TokenExpiresAt = &expiresAt
-			}
+			// auth-required verdict left by an earlier failed/pending probe
+			// as soon as a later connection succeeds and persists a fresh
+			// token; ApplyToHealthInput also ignores a stale LastError while
+			// the server is Connected.
+			oauth.ApplyToHealthInput(&healthInput, s.runtime.StorageManager(), serverStatus.Name, url, true)
 		}
 
 		// T032: Wire refresh state into health calculation (Spec 023)
