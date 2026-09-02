@@ -58,6 +58,31 @@ func CalculateOAuthStatus(token *storage.OAuthTokenRecord, lastError string) OAu
 	return OAuthStatusAuthenticated
 }
 
+// ResolveStatus looks up the persisted OAuth token for serverName+serverURL and
+// derives the health-facing OAuthStatus, refresh-token presence, and expiry from
+// it. Centralizes the token lookup + CalculateOAuthStatus pairing so every
+// status surface (REST /api/v1/servers, the upstream_servers MCP tool, the
+// tray, the CLI) recomputes OAuth status from the CURRENT stored token on every
+// read instead of a caller leaving HealthCalculatorInput.OAuthStatus at its zero
+// value (""). The health calculator reads an empty OAuthStatus as "never
+// authenticated" and reports "Authentication required" — even once the server
+// is Connected/Ready with tools listed. Recomputing here means a later
+// successful connection (which persists a fresh token) clears any stale
+// auth-required verdict left over from an earlier failed or pending probe.
+// Returns OAuthStatusNone (and zero refresh/expiry) when no token is stored or
+// storage is unavailable.
+func ResolveStatus(store *storage.Manager, serverName, serverURL, lastError string) (status OAuthStatus, hasRefreshToken bool, tokenExpiresAt time.Time) {
+	if store == nil {
+		return OAuthStatusNone, false, time.Time{}
+	}
+	serverKey := GenerateServerKey(serverName, serverURL)
+	token, err := store.GetOAuthToken(serverKey)
+	if err != nil || token == nil {
+		return OAuthStatusNone, false, time.Time{}
+	}
+	return CalculateOAuthStatus(token, lastError), token.RefreshToken != "", token.ExpiresAt
+}
+
 // IsOAuthError checks if an error message indicates an OAuth-related problem.
 // This is the exported version for use by other packages.
 func IsOAuthError(err string) bool {
