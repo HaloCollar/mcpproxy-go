@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/health"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 
 	"github.com/stretchr/testify/assert"
@@ -124,82 +123,12 @@ func TestCalculateOAuthStatus(t *testing.T) {
 	}
 }
 
-// TestResolveStatus_ClearsStaleAuthRequiredVerdictAfterConnect reproduces the
-// WP5 bug report: a server that connects successfully and lists tools kept
-// showing health.Level=unhealthy "Authentication required" alongside
-// state=Ready, an empty last_error, and a non-zero tool count — a verdict left
-// over from an earlier probe before any token was stored. It asserts the
-// end-to-end sequence: verdict set (no token yet) -> connect succeeds (token
-// persisted) -> verdict cleared, exercising the exact ResolveStatus +
-// CalculateHealth pairing every status surface (REST, MCP tool, CLI, tray)
-// now uses.
-func TestResolveStatus_ClearsStaleAuthRequiredVerdictAfterConnect(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "oauth-resolve-status-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
-
-	mgr, err := storage.NewManager(tmpDir, zap.NewNop().Sugar())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = mgr.Close() })
-
-	const (
-		serverName = "notion"
-		serverURL  = "https://mcp.notion.com/mcp"
-	)
-
-	// Before any token is stored — e.g., an earlier failed/pending OAuth
-	// probe — ResolveStatus must report "none", which is exactly the input
-	// that produces the "Authentication required" verdict. Connected is
-	// false here (matches an in-progress/failed probe, not yet Ready).
-	result := ResolveStatus(mgr, serverName, serverURL, true, false, "")
-	assert.Equal(t, OAuthStatusNone, result.Status)
-	assert.False(t, result.HasRefreshToken)
-	assert.True(t, result.TokenExpiresAt.IsZero())
-	assert.False(t, result.HasToken)
-
-	before := health.CalculateHealth(health.HealthCalculatorInput{
-		Name:          serverName,
-		Enabled:       true,
-		State:         "ready",
-		Connected:     false,
-		OAuthRequired: true,
-		OAuthStatus:   result.Status.String(),
-		ToolCount:     0,
-	}, nil)
-	require.Equal(t, health.LevelUnhealthy, before.Level)
-	require.Equal(t, "Authentication required", before.Summary)
-
-	// A later connection succeeds and persists a fresh OAuth token, exactly
-	// as the real connect flow does via PersistentTokenStore.SaveToken.
-	serverKey := GenerateServerKey(serverName, serverURL)
-	require.NoError(t, mgr.GetBoltDB().SaveOAuthToken(&storage.OAuthTokenRecord{
-		ServerName:  serverKey,
-		AccessToken: "at",
-		ExpiresAt:   time.Now().Add(time.Hour),
-	}))
-
-	// Recomputing OAuth status against the now-present token must clear the
-	// stale verdict — no leftover "Authentication required" once the server
-	// is Ready with callable tools.
-	result = ResolveStatus(mgr, serverName, serverURL, true, true, "")
-	assert.Equal(t, OAuthStatusAuthenticated, result.Status)
-	assert.False(t, result.HasRefreshToken) // no refresh token saved above
-	assert.False(t, result.TokenExpiresAt.IsZero())
-	assert.True(t, result.HasToken)
-	assert.True(t, result.TokenValid)
-
-	after := health.CalculateHealth(health.HealthCalculatorInput{
-		Name:          serverName,
-		Enabled:       true,
-		State:         "ready",
-		Connected:     true,
-		OAuthRequired: true,
-		OAuthStatus:   result.Status.String(),
-		ToolCount:     34,
-	}, nil)
-	assert.Equal(t, health.LevelHealthy, after.Level)
-	assert.NotEqual(t, "Authentication required", after.Summary)
-}
+// TestResolveStatus_ClearsStaleAuthRequiredVerdictAfterConnect (the
+// end-to-end WP5 bug reproduction pairing ResolveStatus with
+// health.CalculateHealth) lives in
+// internal/health/oauth_apply_test.go: an internal (package oauth) test
+// file importing internal/health would create an import cycle now that
+// health imports oauth (for health.ApplyOAuth's oauth.Resolved parameter).
 
 // TestResolveStatus_ConnectedIgnoresStaleLastError reproduces the second
 // half of the WP5 bug: a server that is currently Connected/Ready but still
@@ -238,6 +167,26 @@ func TestResolveStatus_ConnectedIgnoresStaleLastError(t *testing.T) {
 	assert.Equal(t, OAuthStatusError, result.Status)
 }
 
+// TestResolveStatus_NoURLNoOAuthConfigSkipsLookup guards review item 5: a
+// server with no URL and no explicit OAuth config (e.g. a stdio-launched
+// server) must get a neutral status without ResolveStatus touching the
+// token store at all — GenerateServerKey(name, "") cannot correspond to a
+// real persisted token, and OAuth does not apply to stdio transport.
+// Exercised against a nil store (which would panic if ResolveStatus tried
+// to call GetOAuthToken on it) to prove the lookup is skipped, not merely
+// that it happens to return nothing.
+func TestResolveStatus_NoURLNoOAuthConfigSkipsLookup(t *testing.T) {
+	result := ResolveStatus(nil, "stdio-server", "", false, false, "")
+	assert.Equal(t, OAuthStatusNone, result.Status)
+	assert.False(t, result.HasToken)
+	assert.False(t, result.AutodiscoveredOAuth)
+
+	// Even a connected stdio server with no config reports the same neutral
+	// status.
+	result = ResolveStatus(nil, "stdio-server", "", false, true, "")
+	assert.Equal(t, OAuthStatusNone, result.Status)
+}
+
 // TestCalculateOAuthStatus_ZeroExpiresAtNeverExpires guards review item 1: a
 // token with no expires_in (zero ExpiresAt) must never be classified as
 // expired — it matches PersistentTokenStore, config.go, and
@@ -249,76 +198,6 @@ func TestCalculateOAuthStatus_ZeroExpiresAtNeverExpires(t *testing.T) {
 		// ExpiresAt intentionally left zero.
 	}
 	assert.Equal(t, OAuthStatusAuthenticated, CalculateOAuthStatus(token, ""))
-}
-
-// TestApplyToHealthInput_ResolvesFromStore is a call-site assertion (review
-// follow-up on 3dfeacec, item 4): it exercises the exact shared constructor
-// that internal/server/server.go's GetAllServers, internal/server/mcp.go's
-// upstream_servers tool handler, and internal/runtime/runtime.go's
-// GetAllServers all call. Reverting any of those wiring hunks back to
-// leaving HealthCalculatorInput.OAuthStatus at its zero value would make
-// this test's "before" and "after" assertions collapse to the same
-// (Unhealthy) result and fail.
-func TestApplyToHealthInput_ResolvesFromStore(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "oauth-apply-health-input-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
-
-	mgr, err := storage.NewManager(tmpDir, zap.NewNop().Sugar())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = mgr.Close() })
-
-	const (
-		serverName = "notion"
-		serverURL  = "https://mcp.notion.com/mcp"
-	)
-
-	input := health.HealthCalculatorInput{
-		Name:          serverName,
-		Enabled:       true,
-		State:         "connected",
-		Connected:     true,
-		OAuthRequired: true,
-		ToolCount:     34,
-		// OAuthStatus intentionally left at its zero value ("") here, as
-		// every real call site constructs it before calling
-		// ApplyToHealthInput.
-	}
-
-	// No token stored yet: ApplyToHealthInput must still resolve a status
-	// (not leave OAuthStatus untouched at "") that, combined with
-	// Connected+ToolCount, does not produce a stale "Authentication
-	// required" verdict.
-	result := ApplyToHealthInput(&input, mgr, serverName, serverURL, true)
-	assert.Equal(t, OAuthStatusNone, result.Status)
-	assert.Equal(t, "none", input.OAuthStatus)
-	before := health.CalculateHealth(input, nil)
-	assert.NotEqual(t, "Authentication required", before.Summary)
-
-	// Persist a token, exactly as a successful connect does. Expiry is set
-	// well beyond health.DefaultHealthConfig's 1-hour ExpiryWarningDuration
-	// so the calculator's separate "token expiring soon" degraded branch
-	// (calculator.go ~line 233) does not fire here — that branch is
-	// correct/unrelated behavior, not the thing under test.
-	serverKey := GenerateServerKey(serverName, serverURL)
-	require.NoError(t, mgr.GetBoltDB().SaveOAuthToken(&storage.OAuthTokenRecord{
-		ServerName:  serverKey,
-		AccessToken: "at",
-		ExpiresAt:   time.Now().Add(24 * time.Hour),
-	}))
-
-	// ApplyToHealthInput must pick up the fresh token on this call — the
-	// entire point of resolving OAuth status from the CURRENT store on
-	// every read instead of caching a value.
-	result = ApplyToHealthInput(&input, mgr, serverName, serverURL, true)
-	assert.Equal(t, OAuthStatusAuthenticated, result.Status)
-	assert.Equal(t, "authenticated", input.OAuthStatus)
-	require.NotNil(t, input.TokenExpiresAt)
-	assert.False(t, input.TokenExpiresAt.IsZero())
-
-	after := health.CalculateHealth(input, nil)
-	assert.Equal(t, health.LevelHealthy, after.Level)
-	assert.NotEqual(t, "Authentication required", after.Summary)
 }
 
 func TestContainsOAuthError(t *testing.T) {

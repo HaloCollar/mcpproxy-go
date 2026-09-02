@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 )
 
 func TestCalculateHealth_DisabledServer(t *testing.T) {
@@ -217,6 +219,30 @@ func TestCalculateHealth_OAuthNoneButConnected(t *testing.T) {
 
 	assert.NotEqual(t, "Authentication required", result.Summary)
 	assert.Equal(t, LevelHealthy, result.Level)
+}
+
+// TestCalculateHealth_OAuthNoneConnectedZeroTools verifies the other side of
+// the item-3 guard: a Connected server that has NOT (yet) listed any tools
+// is not proof of a working authenticated session on its own, so it must
+// still fall through to "Authentication required" rather than being
+// exempted purely by Connected==true (review follow-up on 1f240114, item 4
+// — the guard is gated on Connected && ToolCount > 0, not Connected alone).
+func TestCalculateHealth_OAuthNoneConnectedZeroTools(t *testing.T) {
+	input := HealthCalculatorInput{
+		Name:          "test-server",
+		Enabled:       true,
+		State:         "connected",
+		Connected:     true,
+		OAuthRequired: true,
+		OAuthStatus:   "none",
+		ToolCount:     0,
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.Equal(t, LevelUnhealthy, result.Level)
+	assert.Equal(t, "Authentication required", result.Summary)
+	assert.Equal(t, ActionLogin, result.Action)
 }
 
 // TestCalculateHealth_OAuthLoginRequired verifies that a server awaiting a
@@ -925,8 +951,21 @@ func TestFormatRefreshRetryDetail(t *testing.T) {
 	})
 }
 
-// TestRefreshStateSync (comparing health.RefreshState* against
-// oauth.RefreshState*) moved to refresh_state_oauth_sync_test.go in the
-// external health_test package: internal/oauth now imports internal/health
-// (status.go's ApplyToHealthInput), so this internal (package health) test
-// file can no longer also import internal/oauth without an import cycle.
+// TestRefreshStateSync ensures health.RefreshState values stay in sync with
+// oauth.RefreshState. The health package mirrors oauth.RefreshState for
+// decoupling (health does not have to change its public enum surface if
+// oauth's changes), but the values must match for proper state mapping when
+// wiring RefreshManager state into health calculation.
+func TestRefreshStateSync(t *testing.T) {
+	// Verify that the integer values match between health and oauth packages.
+	// This test will fail if either package changes its constants without
+	// updating the other.
+	assert.Equal(t, int(RefreshStateIdle), int(oauth.RefreshStateIdle),
+		"RefreshStateIdle values must match between health and oauth packages")
+	assert.Equal(t, int(RefreshStateScheduled), int(oauth.RefreshStateScheduled),
+		"RefreshStateScheduled values must match between health and oauth packages")
+	assert.Equal(t, int(RefreshStateRetrying), int(oauth.RefreshStateRetrying),
+		"RefreshStateRetrying values must match between health and oauth packages")
+	assert.Equal(t, int(RefreshStateFailed), int(oauth.RefreshStateFailed),
+		"RefreshStateFailed values must match between health and oauth packages")
+}

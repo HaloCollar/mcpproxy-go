@@ -5,7 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/smart-mcp-proxy/mcpproxy-go/internal/health"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 
 	"go.uber.org/zap"
@@ -65,8 +64,8 @@ func CalculateOAuthStatus(token *storage.OAuthTokenRecord, lastError string) OAu
 	return OAuthStatusAuthenticated
 }
 
-// ResolveStatusResult is the outcome of ResolveStatus.
-type ResolveStatusResult struct {
+// Resolved is the outcome of ResolveStatus.
+type Resolved struct {
 	// Status is the health-facing OAuth status for the server.
 	Status OAuthStatus
 	// HasRefreshToken reports whether the stored token can be auto-refreshed.
@@ -98,7 +97,10 @@ type ResolveStatusResult struct {
 // surface (REST /api/v1/servers, the upstream_servers MCP tool, the tray,
 // the CLI) recomputes OAuth status from the CURRENT stored token on every
 // read instead of a caller leaving HealthCalculatorInput.OAuthStatus at its
-// zero value (""). The health calculator reads an empty/none OAuthStatus on
+// zero value (""). Pair this with health.ApplyOAuth (package health) to
+// write the result into a health.HealthCalculatorInput — that helper lives
+// in package health, not here, so internal/oauth has no dependency on
+// internal/health. The health calculator reads an empty/none OAuthStatus on
 // a NOT-connected server as "never authenticated" and reports "Authentication
 // required"; recomputing here means a later successful connection (which
 // persists a fresh token) clears any stale auth-required verdict left over
@@ -122,9 +124,22 @@ type ResolveStatusResult struct {
 // only turns a None/empty OAuthStatus into "Authentication required" when
 // the server is NOT connected, so a transient storage hiccup on an actually
 // Connected server cannot surface a false alarm either way.
-func ResolveStatus(store *storage.Manager, serverName, serverURL string, oauthConfigured, connected bool, lastError string) ResolveStatusResult {
+func ResolveStatus(store *storage.Manager, serverName, serverURL string, oauthConfigured, connected bool, lastError string) Resolved {
 	if connected {
 		lastError = ""
+	}
+
+	// A server with no URL and no explicit OAuth config (e.g. a
+	// stdio-launched server, or a Config snapshot that hasn't arrived yet)
+	// has no meaningful PersistentTokenStore key — GenerateServerKey
+	// combines serverName+serverURL, so an empty URL only ever yields a key
+	// that cannot correspond to a real token — and OAuth does not apply to
+	// stdio transport at all. Report a neutral status without touching
+	// storage, rather than performing a bbolt lookup for every such server
+	// on every status poll (mirrors the pre-refactor Runtime.GetAllServers,
+	// which gated its token lookup on url != "").
+	if serverURL == "" && !oauthConfigured {
+		return Resolved{Status: OAuthStatusNone}
 	}
 
 	var token *storage.OAuthTokenRecord
@@ -140,7 +155,7 @@ func ResolveStatus(store *storage.Manager, serverName, serverURL string, oauthCo
 		token = t
 	}
 
-	var result ResolveStatusResult
+	var result Resolved
 	knownOAuth := oauthConfigured
 
 	switch {
@@ -180,28 +195,6 @@ func ResolveStatus(store *storage.Manager, serverName, serverURL string, oauthCo
 		}
 	}
 
-	return result
-}
-
-// ApplyToHealthInput resolves the given server's live OAuth status via
-// ResolveStatus and writes it into input's OAuthStatus, HasRefreshToken, and
-// TokenExpiresAt fields, using input.Connected and input.LastError as the
-// connection signals. Every call site that builds a
-// health.HealthCalculatorInput for an OAuth-relevant server (REST
-// /api/v1/servers, the upstream_servers MCP tool, Runtime.GetAllServers)
-// funnels through this single function instead of hand-rolling the OAuth
-// fields, so a later successful connection is guaranteed to clear a stale
-// auth-required verdict on every surface identically. Returns the full
-// ResolveStatusResult for callers (e.g. Runtime.GetAllServers) that also need
-// AutodiscoveredOAuth/TokenValid to build a display-only "oauth" config map.
-func ApplyToHealthInput(input *health.HealthCalculatorInput, store *storage.Manager, serverName, serverURL string, oauthConfigured bool) ResolveStatusResult {
-	result := ResolveStatus(store, serverName, serverURL, oauthConfigured, input.Connected, input.LastError)
-	input.OAuthStatus = result.Status.String()
-	input.HasRefreshToken = result.HasRefreshToken
-	if !result.TokenExpiresAt.IsZero() {
-		expiresAt := result.TokenExpiresAt
-		input.TokenExpiresAt = &expiresAt
-	}
 	return result
 }
 
