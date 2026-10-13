@@ -30,6 +30,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/server/tokens"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/shellwrap"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tagscope"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/truncate"
@@ -141,6 +142,10 @@ type MCPProxyServer struct {
 	// tokens; execution-time authorization remains authoritative.
 	directToolPermsMu sync.RWMutex
 	directToolPerms   map[string]string
+	// directToolServers maps direct-mode tool names to the REAL upstream server
+	// name (guarded by directToolPermsMu). Server names may contain "__", so the
+	// tag-scope list filter must not re-parse the server from the tool name.
+	directToolServers map[string]string
 
 	// Spec 049: in-memory only counter of retrieve_tools calls that opted into
 	// include_disabled. Never persisted (privacy, consistent with Spec 042).
@@ -550,6 +555,16 @@ func buildCallToolVariantTool(variant string) mcp.Tool {
 		mcp.WithString("intent_reason",
 			mcp.Description(reasonDesc),
 		),
+		mcp.WithString("save_to_file",
+			mcp.Description("Absolute path under a configured tool_output_roots entry. Writes the full untruncated response there and returns a short JSON envelope instead. See docs/configuration.md#save-tool-output-to-file."),
+		),
+		mcp.WithString("save_format",
+			mcp.Enum("text", "json"),
+			mcp.Description("Only used with save_to_file. 'text' (default) writes the concatenated text content blocks — the same blocks the response-limit truncator would otherwise truncate one at a time — untruncated; 'json' writes the full result including non-text content. See docs/configuration.md#save-tool-output-to-file."),
+		),
+		mcp.WithBoolean("save_overwrite",
+			mcp.Description("Only used with save_to_file. Default false rejects an existing target file; set true to replace it. See docs/configuration.md#save-tool-output-to-file."),
+		),
 	)
 
 	return mcp.NewTool(variant, allOpts...)
@@ -709,6 +724,9 @@ func (p *MCPProxyServer) buildManagementTools() []mcpserver.ServerTool {
 			),
 			mcp.WithString("oauth_json",
 				mcp.Description("OAuth config as JSON object. MERGES with existing settings. Use 'null' to remove OAuth entirely. Fields: client_id, client_secret, scopes (array - replaces)."),
+			),
+			mcp.WithString("tags_json",
+				mcp.Description("Upstream tags as a JSON array of strings, e.g. '[\"halo\",\"personal\"]'. Tags scope the server to client sessions: an untagged server is visible to all clients; a tagged server is only visible to sessions that request an intersecting scope via the /mcp endpoint's `?tags=` query. On add/update this REPLACES the tag set. If require_server_tags is enabled, add requires at least one tag."),
 			),
 			mcp.WithBoolean("enabled",
 				mcp.Description("Whether server should be enabled (default: true)"),
@@ -1149,6 +1167,9 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 	enforceAgentScope := authCtx != nil && !authCtx.IsAdmin()
 	// Spec 057: profile scope filter — independent of agent-scope (nil = allow all).
 	profileScope := profile.ProfileScopeFromContext(ctx)
+	// Option B: per-session tag scope filter — resolved from the `?tags=` query
+	// on the /mcp endpoint. nil = no scope declared = allow all (backward compat).
+	tagScope := tagscope.TagScopeFromContext(ctx)
 
 	// Spec 049: opt-in discovery of locked tools. When false (default) the
 	// behavior below is byte-for-byte identical to before — disabled tools are
@@ -1183,6 +1204,11 @@ func (p *MCPProxyServer) handleRetrieveToolsWithMode(ctx context.Context, reques
 		// Spec 057: profile filter — runs independently of agent-scope so that
 		// unauthenticated /mcp/p/<slug> connections (AdminContext) are still filtered.
 		if !profileScope.Allows(serverName) {
+			continue
+		}
+		// Option B: per-session tag scope filter — out-of-scope servers are
+		// absent from retrieve_tools results (nil scope = allow all).
+		if !tagScope.Allows(serverName) {
 			continue
 		}
 
@@ -1558,6 +1584,25 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 		}
 	}
 
+	// save_to_file (Spec 076): parsed here (rather than deep in the response
+	// handling below) so it lives right next to the other request-parameter
+	// extraction. An empty Path means the feature was not requested for this
+	// call — see maybeSaveToFile in content_forward.go.
+	// request.GetString/GetBool are lenient: a wrong-typed argument (e.g. a
+	// JSON number for save_to_file) silently falls back to the default
+	// ("" / false) rather than erroring, which would make save_to_file
+	// silently not happen instead of surfacing the caller's mistake. Check
+	// the raw argument types explicitly before parsing.
+	if errResult := validateSaveToFileArgTypes(request); errResult != nil {
+		return errResult, nil
+	}
+
+	saveParams := saveToFileParams{
+		Path:      request.GetString("save_to_file", ""),
+		Format:    request.GetString("save_format", ""),
+		Overwrite: request.GetBool("save_overwrite", false),
+	}
+
 	// Handle upstream tools via upstream manager (requires server:tool format)
 	if !strings.Contains(toolName, ":") {
 		return mcp.NewToolResultError(fmt.Sprintf("Invalid tool name format: %s (expected server:tool)", toolName)), nil
@@ -1572,6 +1617,14 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	// unauthenticated /mcp/p/<slug> connections (AdminContext) are still filtered.
 	if profileScope := profile.ProfileScopeFromContext(ctx); profileScope != nil && !profileScope.Allows(serverName) {
 		errMsg := fmt.Sprintf("server '%s' is not in profile '%s'", serverName, profileScope.Name)
+		p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
+	}
+
+	// Option B: per-session tag scope filter — refuse out-of-scope servers with
+	// a clear error. nil scope (no `?tags=` declared) allows everything.
+	if tagScope := tagscope.TagScopeFromContext(ctx); tagScope != nil && !tagScope.Allows(serverName) {
+		errMsg := fmt.Sprintf("server '%s' is out of scope for this session (session tags: %s)", serverName, tagScope.TagsString())
 		p.emitActivityPolicyDecision(serverName, actualToolName, getSessionID(), "blocked", errMsg)
 		return mcp.NewToolResultError(errMsg), nil
 	}
@@ -1898,56 +1951,117 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	activityResponseBytes := rawByteSize(result)
 	activityRequestBytes := rawByteSize(activityArgs)
 
-	forwarded, response, wasTruncated := forwardContentResult(result, p.truncator, p.cacheManager, p.logger, toolName, args)
-
-	// Spec 056: output-schema validation. Strict mode blocks a violating result
-	// (returns an error); warn mode forwards unchanged after recording a
-	// policy_decision. No-op when disabled / no schema / error result.
-	if blockResult := p.applyOutputValidation(ctx, serverName, actualToolName, forwarded); blockResult != nil {
-		return blockResult, nil
+	// save_to_file (Spec 076): must run BEFORE forwardContentResult's
+	// truncation so the file it writes is always the complete, untruncated
+	// response. It runs AFTER applyOutputSanitisation above (redact/strip/
+	// block), so a saved file never contains an unredacted secret, and it
+	// never intercepts an upstream error result (maybeSaveToFile returns
+	// handled=false for those — see its doc comment).
+	//
+	// tool_output_roots/tool_output_max_bytes are read from the LIVE config
+	// snapshot, not p.config: p.config is captured once in NewMCPProxyServer
+	// and never reassigned, so a hot-reloaded change to these settings would
+	// otherwise silently not take effect until a full restart. This mirrors
+	// the pattern used for the tokenizer model just above.
+	saveCfg := saveToFileConfig{
+		Roots:    p.config.ToolOutputRoots,
+		MaxBytes: p.config.ToolOutputMaxBytes,
 	}
-
-	// Spec 054 Track B (post-forward): spotlight untrusted text in
-	// source-identifying delimiters. Lossless and non-cacheable, so it runs
-	// after truncation. response is refreshed so logs/metrics match agent output.
-	p.spotlightForwarded(serverName, actualToolName, contentTrust, forwarded)
-	response = forwardedText(forwarded, response)
-
-	// Track truncation in token metrics
-	if wasTruncated && tokenMetrics != nil && p.mainServer != nil && p.mainServer.runtime != nil {
-		tokenizer := p.mainServer.runtime.Tokenizer()
-		if tokenizer != nil {
-			truncatedTokens, err := tokenizer.CountTokensForModel(response, tokenMetrics.Model)
-			if err == nil {
-				tokenMetrics.WasTruncated = true
-				tokenMetrics.OutputTokens = truncatedTokens
-				tokenMetrics.TotalTokens = tokenMetrics.InputTokens + tokenMetrics.OutputTokens
-				toolCallRecord.Metrics = tokenMetrics
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		if live := p.mainServer.runtime.Config(); live != nil {
+			saveCfg = saveToFileConfig{
+				Roots:    live.ToolOutputRoots,
+				MaxBytes: live.ToolOutputMaxBytes,
 			}
 		}
 	}
 
-	// Store successful tool call in history
-	if err := p.storage.RecordToolCall(toolCallRecord); err != nil {
-		p.logger.Warn("Failed to record successful tool call", zap.Error(err))
+	var forwarded *mcp.CallToolResult
+	var response string
+	var wasTruncated bool
+	var savedToFile bool
+	if saveResult, saveHandled := maybeSaveToFile(result, saveParams, saveCfg); saveHandled {
+		// A failed save_to_file (invalid/outside-roots path, write error, ...)
+		// still already executed the upstream call, so it must NOT skip the
+		// audit trail below (RecordToolCall/UpdateSessionStats/emitActivity*) —
+		// it falls through exactly like a successful save. toolCallRecord.Error
+		// is set here so history reflects the save failure specifically.
+		savedToFile = true
+		forwarded = saveResult
+		response = forwardedText(forwarded, "")
+		if saveResult.IsError {
+			toolCallRecord.Error = response
+		}
+		// The envelope/error text IS the response — skip forwardContentResult
+		// (no truncation applies to it) and the output-schema/spotlight passes
+		// below: its shape intentionally doesn't match the upstream tool's own
+		// declared output schema, and there is no untrusted upstream text left
+		// in it worth spotlighting, in both the success and failure case.
+	} else {
+		forwarded, response, wasTruncated = forwardContentResult(result, p.truncator, p.cacheManager, p.logger, toolName, args)
+
+		// Spec 056: output-schema validation. Strict mode blocks a violating result
+		// (returns an error); warn mode forwards unchanged after recording a
+		// policy_decision. No-op when disabled / no schema / error result.
+		if blockResult := p.applyOutputValidation(ctx, serverName, actualToolName, forwarded); blockResult != nil {
+			return blockResult, nil
+		}
+
+		// Spec 054 Track B (post-forward): spotlight untrusted text in
+		// source-identifying delimiters. Lossless and non-cacheable, so it runs
+		// after truncation. response is refreshed so logs/metrics match agent output.
+		p.spotlightForwarded(serverName, actualToolName, contentTrust, forwarded)
+		response = forwardedText(forwarded, response)
 	}
 
-	// Update session stats for successful call
+	// Correct tokenMetrics for a truncated or save_to_file-diverted response —
+	// see recountSaveOrTruncateTokenMetrics's doc comment for why this needs
+	// its own fallback path (tokenizer nil / erroring) rather than just
+	// skipping the correction. Factored into a pure, directly unit-testable
+	// function (save_to_file_test.go: TestRecountSaveOrTruncateTokenMetrics_*)
+	// rather than inlined here, since this block's own logic — not the
+	// surrounding request plumbing — is what the fix pass changed.
+	var tokenizerForRecount tokens.Tokenizer
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		tokenizerForRecount = p.mainServer.runtime.Tokenizer()
+	}
+	if recountSaveOrTruncateTokenMetrics(tokenMetrics, wasTruncated, savedToFile, response, tokenizerForRecount) {
+		toolCallRecord.Metrics = tokenMetrics
+	}
+
+	// Store tool call in history — a failed save_to_file still recorded an
+	// upstream call (toolCallRecord.Error is set above for that case), so
+	// this must run for every path (success, save success, save failure).
+	if err := p.storage.RecordToolCall(toolCallRecord); err != nil {
+		p.logger.Warn("Failed to record tool call", zap.Error(err))
+	}
+
+	// Update session stats for the call
 	if sessionID != "" && tokenMetrics != nil {
 		p.sessionStore.UpdateSessionStats(sessionID, tokenMetrics.TotalTokens)
 	}
 
-	// Emit activity completed event for success (with intent metadata for Spec 018)
+	// Emit activity completed event (with intent metadata for Spec 018).
+	// A failed save_to_file is reported as status "error" — the upstream call
+	// executed but the caller did not get the file it asked for. The non-save
+	// path is unchanged: an upstream tool-level error result (IsError set by
+	// the upstream) keeps reporting "success" here exactly as before.
 	responseTruncated := tokenMetrics != nil && tokenMetrics.WasTruncated
+	status := "success"
+	errText := ""
+	if savedToFile && forwarded != nil && forwarded.IsError {
+		status = "error"
+		errText = response
+	}
 	var intentMap map[string]interface{}
 	if intent != nil {
 		intentMap = intent.ToMap()
 	}
-	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "success", "", duration.Milliseconds(), activityArgs, response, responseTruncated, toolVariant, intentMap, contentTrust, profileSlug, activityRequestBytes, activityResponseBytes)
+	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, status, errText, duration.Milliseconds(), activityArgs, response, responseTruncated, toolVariant, intentMap, contentTrust, profileSlug, activityRequestBytes, activityResponseBytes)
 
-	// Spec 024: Emit internal tool call event for success
+	// Spec 024: Emit internal tool call event
 	internalToolName := "call_tool_" + intent.OperationType // e.g., "call_tool_read"
-	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "success", "", time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap, "")
+	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, status, errText, time.Since(internalStartTime).Milliseconds(), activityArgs, result, intentMap, "")
 
 	return forwarded, nil
 }
@@ -2529,6 +2643,13 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 		}
 	}
 
+	// Option B: a tag-scoped session may only manage servers inside its scope
+	// (list is filtered by the handler; add may not overwrite an out-of-scope server).
+	if msg := p.tagScopeManagementBlock(ctx, operation, request.GetString("name", "")); msg != "" {
+		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", msg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		return mcp.NewToolResultError(msg), nil
+	}
+
 	// Spec 028: Agent tokens can only list servers (filtered to allowed) — block all write operations
 	if authCtx := auth.AuthContextFromContext(ctx); authCtx != nil && !authCtx.IsAdmin() {
 		switch operation {
@@ -2626,6 +2747,13 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 		errMsg := "Agent tokens cannot perform quarantine security operations"
 		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(errMsg), nil
+	}
+
+	// Option B: a tag-scoped session may only inspect or change quarantine state
+	// of servers inside its scope (list_quarantined is filtered by the handler).
+	if msg := p.tagScopeManagementBlock(ctx, operation, request.GetString("name", "")); msg != "" {
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", msg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		return mcp.NewToolResultError(msg), nil
 	}
 
 	// Security checks
@@ -2887,6 +3015,18 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 		servers = filtered
 	}
 
+	// Option B: filter to servers visible in the active per-session tag scope so
+	// an out-of-scope server never appears in `upstream_servers list` either.
+	if tagScope := tagscope.TagScopeFromContext(ctx); tagScope != nil {
+		var filtered []*config.ServerConfig
+		for _, s := range servers {
+			if tagScope.Allows(s.Name) {
+				filtered = append(filtered, s)
+			}
+		}
+		servers = filtered
+	}
+
 	// Check Docker availability only if Docker isolation is globally enabled
 	dockerIsolationGlobalEnabled := p.config.DockerIsolation != nil && p.config.DockerIsolation.Enabled
 	var dockerAvailable bool
@@ -2920,6 +3060,9 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 			"quarantined": server.Quarantined,
 			"created":     server.Created,
 			"updated":     server.Updated,
+		}
+		if len(server.Tags) > 0 {
+			serverMap["tags"] = server.Tags
 		}
 
 		// Add connection status information and calculate health
@@ -2991,6 +3134,26 @@ func (p *MCPProxyServer) handleListUpstreams(ctx context.Context) (*mcp.CallTool
 			ToolCount:      toolCount,
 			MissingSecret:  health.ExtractMissingSecret(lastError),
 			OAuthConfigErr: health.ExtractOAuthConfigError(lastError),
+		}
+
+		// Recompute OAuth status from the currently stored token (via the
+		// shared oauth.ResolveStatus + health.ApplyOAuth pairing, also used
+		// by Runtime.GetAllServers and the REST /api/v1/servers path)
+		// instead of leaving healthInput.OAuthStatus at its zero value
+		// (""), which CalculateHealth reads as "never authenticated" and
+		// reports as "Authentication required" — even once the server is
+		// Connected/Ready with tools listed. This clears a stale
+		// auth-required verdict left by an earlier failed/pending probe as
+		// soon as a later connection succeeds and persists a fresh token;
+		// ResolveStatus also ignores a stale LastError while the server is
+		// Connected.
+		if server.OAuth != nil {
+			var storageManager *storage.Manager
+			if p.mainServer != nil && p.mainServer.runtime != nil {
+				storageManager = p.mainServer.runtime.StorageManager()
+			}
+			result := oauth.ResolveStatus(storageManager, server.Name, server.URL, true, healthInput.Connected, healthInput.LastError)
+			health.ApplyOAuth(&healthInput, result)
 		}
 
 		// T032: Wire refresh state into health calculation (Spec 023)
@@ -3275,10 +3438,21 @@ func (p *MCPProxyServer) getDockerContainerInfo(client *managed.Client) map[stri
 	return result
 }
 
-func (p *MCPProxyServer) handleListQuarantinedUpstreams(_ context.Context) (*mcp.CallToolResult, error) {
+func (p *MCPProxyServer) handleListQuarantinedUpstreams(ctx context.Context) (*mcp.CallToolResult, error) {
 	servers, err := p.storage.ListQuarantinedUpstreamServers()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list quarantined upstreams: %v", err)), nil
+	}
+
+	// Option B: hide quarantined servers outside the session's tag scope.
+	if tagScope := tagscope.TagScopeFromContext(ctx); tagScope != nil {
+		filtered := servers[:0:0]
+		for _, s := range servers {
+			if s != nil && tagScope.Allows(s.Name) {
+				filtered = append(filtered, s)
+			}
+		}
+		servers = filtered
 	}
 
 	jsonResult, err := json.Marshal(map[string]interface{}{
@@ -3741,6 +3915,40 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		oauth = &oauthConfig
 	}
 
+	// Handle tags: accept either tags_json (a JSON array string) or a native
+	// `tags` array in the arguments. Option B — per-upstream tags/scopes.
+	var tags []string
+	if tagsJSON := request.GetString("tags_json", ""); tagsJSON != "" {
+		if err := json.Unmarshal([]byte(tagsJSON), &tags); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Invalid tags_json format: %v", err)), nil
+		}
+	}
+	if tags == nil && request.Params.Arguments != nil {
+		if argumentsMap, ok := request.Params.Arguments.(map[string]interface{}); ok {
+			if tagsParam, ok := argumentsMap["tags"]; ok {
+				if tagsList, ok := tagsParam.([]interface{}); ok {
+					for _, t := range tagsList {
+						if tStr, ok := t.(string); ok {
+							tags = append(tags, tStr)
+						}
+					}
+				}
+			}
+		}
+	}
+	tags = config.NormalizeTags(tags)
+
+	// Enforce require_server_tags: reject an untagged add when the policy is on.
+	requireTags := false
+	if p.mainServer != nil && p.mainServer.runtime != nil {
+		if cfg := p.mainServer.runtime.Config(); cfg != nil {
+			requireTags = cfg.RequireServerTags
+		}
+	}
+	if err := config.ValidateServerTagRequirement(requireTags, name, tags); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	// Auto-detect protocol
 	protocol := request.GetString("protocol", "")
 	if protocol == "" {
@@ -3767,6 +3975,7 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		Created:     time.Now(),
 		Isolation:   isolation,
 		OAuth:       oauth,
+		Tags:        tags,
 	}
 
 	// Save to storage
@@ -3847,6 +4056,9 @@ func (p *MCPProxyServer) handleAddUpstream(ctx context.Context, request mcp.Call
 		"connection_status":  connectionStatus,
 		"connection_message": connectionMessage,
 		"quarantined":        quarantined,
+	}
+	if len(tags) > 0 {
+		responseMap["tags"] = tags
 	}
 
 	if len(dockerWarnings) > 0 {
@@ -3977,6 +4189,11 @@ func (p *MCPProxyServer) handleUpdateUpstream(ctx context.Context, request mcp.C
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to merge config: %v", err)), nil
 	}
 
+	// Option B: require_server_tags must also hold when a patch changes tags.
+	if err := p.validatePatchedTags(patch, mergedServer); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	// Log the config diff for audit trail (FR-006)
 	if configDiff != nil && !configDiff.IsEmpty() {
 		p.logger.Info("Server config updated via MCP tool",
@@ -4084,6 +4301,11 @@ func (p *MCPProxyServer) handlePatchUpstream(_ context.Context, request mcp.Call
 	mergedServer, configDiff, err := config.MergeServerConfig(existingServer, patch, mergeOpts)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to merge config: %v", err)), nil
+	}
+
+	// Option B: require_server_tags must also hold when a patch changes tags.
+	if err := p.validatePatchedTags(patch, mergedServer); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Log the config diff for audit trail (FR-006)
@@ -4270,6 +4492,26 @@ func (p *MCPProxyServer) buildPatchConfigFromRequest(request mcp.CallToolRequest
 				return nil, opts, fmt.Errorf("invalid oauth_json format: %v", err)
 			}
 			patch.OAuth = &oauth
+		}
+	}
+
+	// Handle tags JSON string (Option B) - array replaced entirely if provided.
+	// A non-empty JSON array replaces the tag set; "[]" or "null" clears tags.
+	if tagsJSON := request.GetString("tags_json", ""); tagsJSON != "" {
+		if tagsJSON == "null" {
+			// Explicit clear: an empty (non-nil) slice replaces the tag set.
+			patch.Tags = []string{}
+		} else {
+			var tags []string
+			if err := json.Unmarshal([]byte(tagsJSON), &tags); err != nil {
+				return nil, opts, fmt.Errorf("invalid tags_json format: %v", err)
+			}
+			// Normalize but keep non-nil so the merge treats it as an explicit
+			// replacement (nil would mean "leave tags untouched").
+			patch.Tags = config.NormalizeTags(tags)
+			if patch.Tags == nil {
+				patch.Tags = []string{}
+			}
 		}
 	}
 

@@ -196,6 +196,55 @@ func TestCalculateHealth_OAuthNone(t *testing.T) {
 	assert.Equal(t, ActionLogin, result.Action)
 }
 
+// TestCalculateHealth_OAuthNoneButConnected verifies that a server which is
+// actually Connected/Ready and has listed tools is NOT reported as
+// "Authentication required" merely because OAuthStatus resolved to
+// none/empty — e.g. a token stored under an unexpected key, auth via a
+// non-OAuth mechanism (static headers) alongside a present-but-unused OAuth
+// config, or a transient token-store lookup failure. A working connection is
+// by definition already authenticated regardless of the OAuth-status signal
+// (review follow-up on 3dfeacec, item 3).
+func TestCalculateHealth_OAuthNoneButConnected(t *testing.T) {
+	input := HealthCalculatorInput{
+		Name:          "test-server",
+		Enabled:       true,
+		State:         "connected",
+		Connected:     true,
+		OAuthRequired: true,
+		OAuthStatus:   "none",
+		ToolCount:     34,
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.NotEqual(t, "Authentication required", result.Summary)
+	assert.Equal(t, LevelHealthy, result.Level)
+}
+
+// TestCalculateHealth_OAuthNoneConnectedZeroTools verifies the other side of
+// the item-3 guard: a Connected server that has NOT (yet) listed any tools
+// is not proof of a working authenticated session on its own, so it must
+// still fall through to "Authentication required" rather than being
+// exempted purely by Connected==true (review follow-up on 1f240114, item 4
+// — the guard is gated on Connected && ToolCount > 0, not Connected alone).
+func TestCalculateHealth_OAuthNoneConnectedZeroTools(t *testing.T) {
+	input := HealthCalculatorInput{
+		Name:          "test-server",
+		Enabled:       true,
+		State:         "connected",
+		Connected:     true,
+		OAuthRequired: true,
+		OAuthStatus:   "none",
+		ToolCount:     0,
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.Equal(t, LevelUnhealthy, result.Level)
+	assert.Equal(t, "Authentication required", result.Summary)
+	assert.Equal(t, ActionLogin, result.Action)
+}
+
 // TestCalculateHealth_OAuthLoginRequired verifies that a server awaiting a
 // first-time OAuth sign-in (ErrOAuthPending deferred for tray/CLI) is reported
 // as degraded/amber with a login action — NOT unhealthy/red (MCP-1820).
@@ -902,12 +951,15 @@ func TestFormatRefreshRetryDetail(t *testing.T) {
 	})
 }
 
-// TestRefreshStateSync ensures health.RefreshState values stay in sync with oauth.RefreshState.
-// The health package mirrors oauth.RefreshState for decoupling, but the values must match
-// for proper state mapping when wiring RefreshManager state into health calculation.
+// TestRefreshStateSync ensures health.RefreshState values stay in sync with
+// oauth.RefreshState. The health package mirrors oauth.RefreshState for
+// decoupling (health does not have to change its public enum surface if
+// oauth's changes), but the values must match for proper state mapping when
+// wiring RefreshManager state into health calculation.
 func TestRefreshStateSync(t *testing.T) {
-	// Verify that the integer values match between health and oauth packages
-	// This test will fail if either package changes its constants without updating the other
+	// Verify that the integer values match between health and oauth packages.
+	// This test will fail if either package changes its constants without
+	// updating the other.
 	assert.Equal(t, int(RefreshStateIdle), int(oauth.RefreshStateIdle),
 		"RefreshStateIdle values must match between health and oauth packages")
 	assert.Equal(t, int(RefreshStateScheduled), int(oauth.RefreshStateScheduled),

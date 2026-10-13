@@ -93,6 +93,12 @@ For stdio-based servers (use -- to separate command):
   mcpproxy upstream add fs -- npx -y @anthropic/mcp-server-filesystem /path/to/dir
   mcpproxy upstream add sqlite -- uvx mcp-server-sqlite --db mydb.db
 
+Scope a server to particular client sessions with repeatable --tag flags:
+  mcpproxy upstream add fs --tag halo -- npx -y @anthropic/mcp-server-filesystem /path
+An untagged server is visible to every client; a tagged server is only visible to
+sessions that request an intersecting scope via the /mcp endpoint (?tags=halo).
+When require_server_tags is enabled in config, --tag is mandatory.
+
 New servers are quarantined by default for security. Use the web UI to approve them.`,
 		RunE: runUpstreamAdd,
 	}
@@ -273,6 +279,7 @@ Examples:
 	upstreamAddTransport    string
 	upstreamAddIfNotExists  bool
 	upstreamAddNoQuarantine bool
+	upstreamAddTags         []string
 
 	// Remove command flags
 	upstreamRemoveYes      bool
@@ -350,6 +357,7 @@ func init() {
 	upstreamAddCmd.Flags().StringVar(&upstreamAddTransport, "transport", "", "Transport type: http or stdio (auto-detected if not specified)")
 	upstreamAddCmd.Flags().BoolVar(&upstreamAddIfNotExists, "if-not-exists", false, "Don't error if server already exists")
 	upstreamAddCmd.Flags().BoolVar(&upstreamAddNoQuarantine, "no-quarantine", false, "Don't quarantine the new server (use with caution)")
+	upstreamAddCmd.Flags().StringArrayVar(&upstreamAddTags, "tag", nil, "Scope tag for this server (repeatable). Untagged servers are visible to all client sessions; tagged servers only to sessions requesting an intersecting scope. Required per server when require_server_tags is enabled.")
 
 	// Remove command flags
 	upstreamRemoveCmd.Flags().BoolVar(&upstreamRemoveYes, "yes", false, "Skip confirmation prompt")
@@ -448,6 +456,7 @@ func runUpstreamListFromConfig(globalConfig *config.Config) error {
 			"protocol":   srv.Protocol,
 			"connected":  false,
 			"tool_count": 0,
+			"tags":       srv.Tags,
 			"status":     summary,
 			"health": map[string]interface{}{
 				"level":       healthStatus.Level,
@@ -490,13 +499,18 @@ func outputServers(servers []map[string]interface{}) error {
 	}
 
 	// For table format, build headers and rows with formatted data
-	headers := []string{"", "NAME", "PROTOCOL", "TOOLS", "STATUS", "ACTION"}
+	headers := []string{"", "NAME", "PROTOCOL", "TAGS", "TOOLS", "STATUS", "ACTION"}
 	rows := make([][]string, 0, len(servers))
 
 	for _, srv := range servers {
 		name := getStringField(srv, "name")
 		protocol := getStringField(srv, "protocol")
 		toolCount := getIntField(srv, "tool_count")
+		tags := getStringSliceField(srv, "tags")
+		tagsCol := "-"
+		if len(tags) > 0 {
+			tagsCol = strings.Join(tags, ",")
+		}
 
 		// Extract unified health status
 		healthData, _ := srv["health"].(map[string]interface{})
@@ -559,6 +573,7 @@ func outputServers(servers []map[string]interface{}) error {
 			statusEmoji,
 			name,
 			protocol,
+			tagsCol,
 			fmt.Sprintf("%d", toolCount),
 			healthSummary,
 			actionHint,
@@ -1233,6 +1248,9 @@ func runUpstreamAdd(cmd *cobra.Command, args []string) error {
 		env[parts[0]] = parts[1]
 	}
 
+	// Normalize scope tags (Option B).
+	tags := config.NormalizeTags(upstreamAddTags)
+
 	// Build the request
 	req := &cliclient.AddServerRequest{
 		Name:       serverName,
@@ -1241,6 +1259,7 @@ func runUpstreamAdd(cmd *cobra.Command, args []string) error {
 		Env:        env,
 		WorkingDir: upstreamAddWorkingDir,
 		Protocol:   transport,
+		Tags:       tags,
 	}
 
 	// Set quarantine based on --no-quarantine flag
@@ -1268,6 +1287,13 @@ func runUpstreamAdd(cmd *cobra.Command, args []string) error {
 		return outputError(output.NewStructuredError(output.ErrCodeConfigNotFound, err.Error()).
 			WithGuidance("Check that your config file exists and is valid").
 			WithRecoveryCommand("mcpproxy doctor"), output.ErrCodeConfigNotFound)
+	}
+
+	// Enforce require_server_tags: reject an untagged add up-front (covers both
+	// daemon and config-file modes) so setup scripts can never miss a scope.
+	if err := config.ValidateServerTagRequirement(globalConfig.RequireServerTags, serverName, tags); err != nil {
+		return outputError(output.NewStructuredError(output.ErrCodeOperationFailed, err.Error()).
+			WithGuidance("Pass one or more --tag <scope> flags, or set require_server_tags:false in config"), output.ErrCodeOperationFailed)
 	}
 
 	// Check if daemon is running
@@ -1340,6 +1366,7 @@ func runUpstreamAddConfigMode(req *cliclient.AddServerRequest, globalConfig *con
 		Protocol:    req.Protocol,
 		Enabled:     true,
 		Quarantined: quarantined,
+		Tags:        req.Tags,
 	}
 
 	// Add to config

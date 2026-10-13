@@ -557,7 +557,14 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		zap.Bool("disable_management", cfg.DisableManagement),
 		zap.Bool("allow_server_add", cfg.AllowServerAdd),
 		zap.Bool("allow_server_remove", cfg.AllowServerRemove),
+		zap.Bool("require_server_tags", cfg.RequireServerTags),
 		zap.Bool("enable_prompts", cfg.EnablePrompts))
+
+	// Option B: surface any pre-existing untagged servers when require_server_tags
+	// is on. Non-fatal — the daemon still starts (see config.Validate).
+	for _, w := range cfg.TagWarnings() {
+		logger.Warn(w)
+	}
 
 	// Ensure API key is configured
 	apiKey, wasGenerated, source := cfg.EnsureAPIKey()

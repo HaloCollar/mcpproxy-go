@@ -1327,6 +1327,9 @@ type AddServerRequest struct {
 	Enabled        *bool              `json:"enabled,omitempty"`
 	Quarantined    *bool              `json:"quarantined,omitempty"`
 	ReconnectOnUse *bool              `json:"reconnect_on_use,omitempty"`
+	// Tags scope the server to client sessions (Option B). On POST (add) a
+	// non-empty array sets the tag set; on PATCH a non-nil array replaces it.
+	Tags []string `json:"tags,omitempty"`
 	// AutoApproveToolChanges is the per-server intent to auto-approve
 	// new/changed tools past the trust baseline (MCP-2930). Tri-state *bool:
 	// a nil pointer means "leave unchanged" on PATCH; a present value
@@ -1454,6 +1457,7 @@ func (s *Server) handleAddServer(w http.ResponseWriter, r *http.Request) {
 		Protocol:    protocol,
 		Enabled:     enabled,
 		Quarantined: quarantined,
+		Tags:        config.NormalizeTags(req.Tags),
 	}
 	if req.ReconnectOnUse != nil {
 		serverConfig.ReconnectOnUse = *req.ReconnectOnUse
@@ -1584,6 +1588,16 @@ func (s *Server) handlePatchServer(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Args != nil {
 		updates.Args = req.Args
+		hasUpdates = true
+	}
+	// Option B: a non-nil Tags array replaces the scope tag set on PATCH.
+	// An explicit empty array clears all tags; omitting the field preserves
+	// the existing tags (nil), matching the other array fields.
+	if req.Tags != nil {
+		updates.Tags = config.NormalizeTags(req.Tags)
+		if updates.Tags == nil {
+			updates.Tags = []string{}
+		}
 		hasUpdates = true
 	}
 	// PATCH semantics for headers and env follow JSON Merge Patch

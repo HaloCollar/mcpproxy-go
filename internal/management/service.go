@@ -321,6 +321,20 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 			srv.WorkingDir = workingDir
 		}
 
+		// Option B: carry per-upstream tags through to the API/UI. Accept both
+		// the typed ([]string, in-process StateView path) and generic
+		// ([]interface{}, post JSON round-trip) shapes.
+		if tags, ok := srvRaw["tags"].([]string); ok {
+			srv.Tags = tags
+		} else if tagsI, ok := srvRaw["tags"].([]interface{}); ok {
+			srv.Tags = make([]string, 0, len(tagsI))
+			for _, t := range tagsI {
+				if ts, ok := t.(string); ok {
+					srv.Tags = append(srv.Tags, ts)
+				}
+			}
+		}
+
 		// Extract headers and env. Accept both typed (map[string]string,
 		// the shape used by the in-process StateView path) and generic
 		// (map[string]interface{}, the shape after a JSON round-trip)

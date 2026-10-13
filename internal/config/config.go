@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,6 +15,10 @@ import (
 
 const (
 	defaultPort = "127.0.0.1:8080" // Localhost-only binding by default for security
+
+	// defaultToolOutputMaxBytes is the save_to_file write-size cap applied
+	// when ToolOutputMaxBytes is unset (0). 50 MiB.
+	defaultToolOutputMaxBytes int64 = 52428800
 
 	// Routing mode constants (Spec 031)
 	RoutingModeRetrieveTools = "retrieve_tools" // Default: BM25 search via retrieve_tools + call_tool_read/write/destructive
@@ -118,6 +123,21 @@ type Config struct {
 	CallToolTimeout    Duration `json:"call_tool_timeout" mapstructure:"call-tool-timeout" swaggertype:"string"`
 	MaxResultSizeChars int      `json:"max_result_size_chars,omitempty" mapstructure:"max-result-size-chars"` // Advertised on every tool as `_meta.anthropic/maxResultSizeChars`; raises Claude Code's inline-response ceiling from 50k to up to 500k chars. Set to 0 to disable.
 
+	// ToolOutputRoots is the whitelist of absolute directory prefixes the
+	// `save_to_file` parameter on call_tool_read/write/destructive is allowed
+	// to write under (Spec 076).
+	// Empty (the default) disables the feature entirely — call_tool_* returns
+	// a "save_to_file is disabled" error for any save_to_file request. Each
+	// entry must be an absolute path (validated in ValidateDetailed) and is
+	// stored filepath.Clean'ed; entries need not exist at startup — they are
+	// resolved (including symlinks) at the time of each save_to_file call, in
+	// internal/outputfile.
+	ToolOutputRoots []string `json:"tool_output_roots,omitempty" mapstructure:"tool-output-roots"`
+	// ToolOutputMaxBytes caps the size of a single save_to_file write. 0 (the
+	// default) means "use the built-in default" (50 MiB); negative values are
+	// a config error. See internal/outputfile.Write.
+	ToolOutputMaxBytes int64 `json:"tool_output_max_bytes,omitempty" mapstructure:"tool-output-max-bytes"`
+
 	// Discovery & health-check cadence (spec 074, #608). Both are *Duration
 	// tri-state pointers: nil = inherit the built-in default; a pointer to 0s =
 	// the loop is disabled; a positive value = that interval. Defaults live only
@@ -148,12 +168,26 @@ type Config struct {
 	AllowServerAdd    bool   `json:"allow_server_add" mapstructure:"allow-server-add"`
 	AllowServerRemove bool   `json:"allow_server_remove" mapstructure:"allow-server-remove"`
 
+	// RequireServerTags, when true, rejects any attempt to register an upstream
+	// server without at least one tag (CLI `upstream add`, the management REST
+	// add path, and the `upstream_servers` add MCP tool). Default false so
+	// upstream/other mcpproxy users see no behaviour change. Pre-existing
+	// untagged servers already in the config are NOT rejected on load — they are
+	// logged loudly as a warning so the operator can tag them — so enabling this
+	// never prevents the daemon from starting.
+	RequireServerTags bool `json:"require_server_tags,omitempty" mapstructure:"require-server-tags"`
+
 	// Internal field to track if API key was explicitly set in config
 	apiKeyExplicitlySet bool `json:"-"`
 
 	// profileWarnings holds non-fatal Spec 057 profile diagnostics (unknown /
 	// empty servers) captured during Validate(), for the boot path to log.
 	profileWarnings []string `json:"-"`
+
+	// tagWarnings holds non-fatal upstream-tag diagnostics captured during
+	// Validate() — currently the "require_server_tags is on but these existing
+	// servers have no tags" warning — for the boot path to log.
+	tagWarnings []string `json:"-"`
 
 	// Prompts settings
 	EnablePrompts bool `json:"enable_prompts" mapstructure:"enable-prompts"`
@@ -340,6 +374,14 @@ type ServerConfig struct {
 	Updated                time.Time        `json:"updated,omitempty" mapstructure:"updated"`
 	Isolation              *IsolationConfig `json:"isolation,omitempty" mapstructure:"isolation"`               // Per-server isolation settings
 	ReconnectOnUse         bool             `json:"reconnect_on_use,omitempty" mapstructure:"reconnect-on-use"` // Attempt reconnection when a tool call targets a disconnected server
+
+	// Tags scope an upstream server to particular client sessions. A server
+	// with no tags is "general" and visible to every client; a tagged server
+	// is only visible to sessions whose declared scope (the `?tags=` query on
+	// the /mcp endpoint) intersects its tags. Empty/omitted preserves the
+	// pre-feature behaviour (server visible to all). See the `require_server_tags`
+	// global knob to make tagging mandatory at registration time.
+	Tags []string `json:"tags,omitempty" mapstructure:"tags"`
 
 	// LauncherWaitTimeout caps how long mcpproxy will wait for a locally-launched
 	// HTTP/SSE upstream's URL to become reachable after Spawn(). Only consulted
@@ -1139,6 +1181,11 @@ func DefaultConfig() *Config {
 		CallToolTimeout:    Duration(2 * time.Minute), // Default 2 minutes for tool calls
 		MaxResultSizeChars: 500000,                    // Claude Code's inline-response hard max
 
+		// save_to_file (Spec 076): disabled by default (no whitelisted roots);
+		// when enabled via config, writes default-cap at 50 MiB per file.
+		ToolOutputRoots:    nil,
+		ToolOutputMaxBytes: defaultToolOutputMaxBytes,
+
 		// Default secure environment configuration
 		Environment: secureenv.DefaultEnvConfig(),
 
@@ -1384,6 +1431,46 @@ func (c *Config) ValidateDetailed() []ValidationError {
 		})
 	}
 
+	// Validate ToolOutputRoots (save_to_file whitelist, Spec 076): every
+	// configured root must be an absolute path, and not the filesystem root
+	// itself. Roots are not required to exist yet.
+	//
+	// A root of "/" (or any OS's equivalent fixed point, e.g. "C:\" on
+	// Windows) would in principle whitelist the entire filesystem — but
+	// outputfile.Resolve's prefix-matching would in practice reject every
+	// requested path under it anyway, because Resolve requires
+	// strings.HasPrefix(target, root+separator), and a root of "/" cleans to
+	// exactly "/" with nothing after the separator to compare against ("/"+
+	// "/" doubles the separator, which no cleaned target path ever starts
+	// with). So "/" is not a privilege-escalation risk today, but it IS a
+	// silently-useless config value that matches nothing — reject it here
+	// with an explicit message rather than let the admin discover the dead
+	// entry only when every save_to_file call against it mysteriously fails.
+	for _, root := range c.ToolOutputRoots {
+		if !filepath.IsAbs(root) {
+			errors = append(errors, ValidationError{
+				Field:   "tool_output_roots",
+				Message: fmt.Sprintf("root %q must be an absolute path", root),
+			})
+			continue
+		}
+		cleaned := filepath.Clean(root)
+		if filepath.Dir(cleaned) == cleaned {
+			errors = append(errors, ValidationError{
+				Field:   "tool_output_roots",
+				Message: fmt.Sprintf("root %q must not be the filesystem root itself — it matches no save_to_file target", root),
+			})
+		}
+	}
+
+	// Validate ToolOutputMaxBytes
+	if c.ToolOutputMaxBytes < 0 {
+		errors = append(errors, ValidationError{
+			Field:   "tool_output_max_bytes",
+			Message: "cannot be negative",
+		})
+	}
+
 	// Validate timeout
 	if c.CallToolTimeout.Duration() <= 0 {
 		errors = append(errors, ValidationError{
@@ -1602,6 +1689,20 @@ func (c *Config) Validate() error {
 	if c.CallToolTimeout.Duration() <= 0 {
 		c.CallToolTimeout = Duration(2 * time.Minute) // Default to 2 minutes
 	}
+	// save_to_file (Spec 076): 0 means "use the built-in default", NOT disabled
+	// (unlike ToolResponseLimit above) — the feature's on/off switch is
+	// ToolOutputRoots being empty, not this cap. Negative values are caught
+	// by ValidateDetailed below and never reach here as a successful Validate().
+	if c.ToolOutputMaxBytes == 0 {
+		c.ToolOutputMaxBytes = defaultToolOutputMaxBytes
+	}
+	if len(c.ToolOutputRoots) > 0 {
+		cleaned := make([]string, len(c.ToolOutputRoots))
+		for i, root := range c.ToolOutputRoots {
+			cleaned[i] = filepath.Clean(root)
+		}
+		c.ToolOutputRoots = cleaned
+	}
 	// Apply code execution defaults
 	if c.CodeExecutionTimeoutMs <= 0 {
 		c.CodeExecutionTimeoutMs = 120000 // 2 minutes (120,000ms)
@@ -1631,6 +1732,18 @@ func (c *Config) Validate() error {
 		return profileErr
 	}
 	c.profileWarnings = profileWarnings
+
+	// Upstream tags (Option B): when require_server_tags is on, surface any
+	// pre-existing untagged servers as a loud warning rather than failing the
+	// load — enabling the policy must never stop the daemon from starting.
+	c.tagWarnings = nil
+	if c.RequireServerTags {
+		if untagged := c.UntaggedServerNames(); len(untagged) > 0 {
+			c.tagWarnings = append(c.tagWarnings, fmt.Sprintf(
+				"require_server_tags is enabled but %d server(s) have no tags and remain visible to every client session: %s — add tags via `mcpproxy upstream add --tag` / the web UI, or set require_server_tags:false",
+				len(untagged), strings.Join(untagged, ", ")))
+		}
+	}
 
 	// Handle API key generation if not configured
 	// Empty string means authentication disabled, nil means auto-generate
