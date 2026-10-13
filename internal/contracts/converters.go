@@ -242,6 +242,18 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 			}
 		}
 
+		// Extract tags slice (Option B)
+		if tags, ok := generic["tags"].([]interface{}); ok {
+			server.Tags = make([]string, 0, len(tags))
+			for _, t := range tags {
+				if tStr, ok := t.(string); ok {
+					server.Tags = append(server.Tags, tStr)
+				}
+			}
+		} else if tags, ok := generic["tags"].([]string); ok {
+			server.Tags = tags
+		}
+
 		// Extract env map
 		if env, ok := generic["env"].(map[string]interface{}); ok {
 			server.Env = make(map[string]string)

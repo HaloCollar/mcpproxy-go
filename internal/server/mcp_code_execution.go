@@ -12,6 +12,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/jsruntime"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/profile"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tagscope"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -215,6 +216,30 @@ func (p *MCPProxyServer) handleCodeExecution(ctx context.Context, request mcp.Ca
 			var intersected []string
 			for _, s := range options.AllowedServers {
 				if _, ok := profileSet[s]; ok {
+					intersected = append(intersected, s)
+				}
+			}
+			options.AllowedServers = intersected
+		}
+	}
+
+	// Option B: intersect the per-session tag scope into code_execution the same
+	// way. A declared `?tags=` scope must restrict which servers the JS can call,
+	// even when the caller supplied no allowed_servers (jsruntime would otherwise
+	// treat an empty list as "allow all").
+	if tagScope := tagscope.TagScopeFromContext(ctx); tagScope != nil {
+		options.RestrictToAllowed = true
+		tagServers := tagScope.AllowedServerNames()
+		if len(options.AllowedServers) == 0 {
+			options.AllowedServers = tagServers
+		} else {
+			tagSet := make(map[string]struct{}, len(tagServers))
+			for _, s := range tagServers {
+				tagSet[s] = struct{}{}
+			}
+			var intersected []string
+			for _, s := range options.AllowedServers {
+				if _, ok := tagSet[s]; ok {
 					intersected = append(intersected, s)
 				}
 			}

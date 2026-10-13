@@ -168,12 +168,26 @@ type Config struct {
 	AllowServerAdd    bool   `json:"allow_server_add" mapstructure:"allow-server-add"`
 	AllowServerRemove bool   `json:"allow_server_remove" mapstructure:"allow-server-remove"`
 
+	// RequireServerTags, when true, rejects any attempt to register an upstream
+	// server without at least one tag (CLI `upstream add`, the management REST
+	// add path, and the `upstream_servers` add MCP tool). Default false so
+	// upstream/other mcpproxy users see no behaviour change. Pre-existing
+	// untagged servers already in the config are NOT rejected on load — they are
+	// logged loudly as a warning so the operator can tag them — so enabling this
+	// never prevents the daemon from starting.
+	RequireServerTags bool `json:"require_server_tags,omitempty" mapstructure:"require-server-tags"`
+
 	// Internal field to track if API key was explicitly set in config
 	apiKeyExplicitlySet bool `json:"-"`
 
 	// profileWarnings holds non-fatal Spec 057 profile diagnostics (unknown /
 	// empty servers) captured during Validate(), for the boot path to log.
 	profileWarnings []string `json:"-"`
+
+	// tagWarnings holds non-fatal upstream-tag diagnostics captured during
+	// Validate() — currently the "require_server_tags is on but these existing
+	// servers have no tags" warning — for the boot path to log.
+	tagWarnings []string `json:"-"`
 
 	// Prompts settings
 	EnablePrompts bool `json:"enable_prompts" mapstructure:"enable-prompts"`
@@ -360,6 +374,14 @@ type ServerConfig struct {
 	Updated                time.Time        `json:"updated,omitempty" mapstructure:"updated"`
 	Isolation              *IsolationConfig `json:"isolation,omitempty" mapstructure:"isolation"`               // Per-server isolation settings
 	ReconnectOnUse         bool             `json:"reconnect_on_use,omitempty" mapstructure:"reconnect-on-use"` // Attempt reconnection when a tool call targets a disconnected server
+
+	// Tags scope an upstream server to particular client sessions. A server
+	// with no tags is "general" and visible to every client; a tagged server
+	// is only visible to sessions whose declared scope (the `?tags=` query on
+	// the /mcp endpoint) intersects its tags. Empty/omitted preserves the
+	// pre-feature behaviour (server visible to all). See the `require_server_tags`
+	// global knob to make tagging mandatory at registration time.
+	Tags []string `json:"tags,omitempty" mapstructure:"tags"`
 
 	// LauncherWaitTimeout caps how long mcpproxy will wait for a locally-launched
 	// HTTP/SSE upstream's URL to become reachable after Spawn(). Only consulted
@@ -1710,6 +1732,18 @@ func (c *Config) Validate() error {
 		return profileErr
 	}
 	c.profileWarnings = profileWarnings
+
+	// Upstream tags (Option B): when require_server_tags is on, surface any
+	// pre-existing untagged servers as a loud warning rather than failing the
+	// load — enabling the policy must never stop the daemon from starting.
+	c.tagWarnings = nil
+	if c.RequireServerTags {
+		if untagged := c.UntaggedServerNames(); len(untagged) > 0 {
+			c.tagWarnings = append(c.tagWarnings, fmt.Sprintf(
+				"require_server_tags is enabled but %d server(s) have no tags and remain visible to every client session: %s — add tags via `mcpproxy upstream add --tag` / the web UI, or set require_server_tags:false",
+				len(untagged), strings.Join(untagged, ", ")))
+		}
+	}
 
 	// Handle API key generation if not configured
 	// Empty string means authentication disabled, nil means auto-generate

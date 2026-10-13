@@ -109,6 +109,7 @@ type UpstreamRecord struct {
 	LauncherWaitTimeout    config.Duration `json:"launcher_wait_timeout,omitempty"` // Spec 046: max wait for locally-launched HTTP/SSE upstream URL to become reachable
 	EnabledTools           []string        `json:"enabled_tools,omitempty"`         // Allowlist: only these tools are exposed
 	DisabledTools          []string        `json:"disabled_tools,omitempty"`        // Denylist: these tools are hidden
+	Tags                   []string        `json:"tags,omitempty"`                  // Option B: per-upstream scope tags (empty = general, visible to all)
 	// MCP-866: persist a server's registry origin + provenance so the
 	// approval/quarantine view and the custom-origin skip_quarantine guard
 	// survive a restart.

@@ -293,6 +293,7 @@ the proxy.
 | `enabled` | boolean | No | Enable/disable server (default: `true`) |
 | `quarantined` | boolean | No | Security quarantine status (default: `false` for manually added servers, `true` for LLM-added servers) |
 | `reconnect_on_use` | boolean | No | When `true`, tool calls to a disconnected server trigger an immediate reconnect attempt (15s timeout) before failing (default: `false`) |
+| `tags` | array | No | Scope tags for this server (see [Server Scope Tags](#server-scope-tags)). A server with no tags is *general* and visible to every client; a tagged server is only visible to client sessions whose declared scope intersects its tags. |
 | `created` | string | No | ISO 8601 timestamp (auto-generated) |
 | `updated` | string | No | ISO 8601 timestamp (auto-updated) |
 
@@ -431,7 +432,8 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
   "read_only_mode": false,
   "disable_management": false,
   "allow_server_add": true,
-  "allow_server_remove": true
+  "allow_server_remove": true,
+  "require_server_tags": false
 }
 ```
 
@@ -442,12 +444,67 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
 | `disable_management` | boolean | `false` | Disable server management operations (restart, enable, disable) |
 | `allow_server_add` | boolean | `true` | Allow adding new servers via API/tools |
 | `allow_server_remove` | boolean | `true` | Allow removing servers via API/tools |
+| `require_server_tags` | boolean | `false` | When `true`, registering an upstream without at least one tag is rejected (CLI `upstream add`, the REST add path, and the `upstream_servers` add tool). Pre-existing untagged servers are not rejected on load — they are logged as a startup warning. See [Server Scope Tags](#server-scope-tags). |
 
 **Security Notes:**
 - **API Key**: Set via `--api-key` flag, `MCPPROXY_API_KEY` environment variable, or config file
 - **Empty API Key**: Empty values are replaced with an auto-generated key; authentication is always enforced
 - **Auto-Generation**: If no API key is provided, one is generated and logged for easy access
 - **Tray Integration**: Tray app automatically manages API keys for core communication
+
+---
+
+## Server Scope Tags
+
+Scope tags let you restrict which upstream servers a given MCP client session
+can see and call, without running multiple mcpproxy instances. This is useful
+when one proxy aggregates servers that belong to different projects and you
+don't want every client to reach every server.
+
+**Model**
+
+- Each server may carry a `tags` array. A server with **no tags** is *general*
+  and visible to **every** client session.
+- A tagged server is visible **only** to sessions whose declared scope
+  intersects the server's tags (case-insensitive).
+- A client declares its scope with a `?tags=` query parameter on the MCP
+  endpoint URL, e.g. `http://127.0.0.1:8080/mcp?tags=halo` or
+  `.../mcp?tags=halo,shared`. A connection **without** `?tags=` declares no
+  scope and sees everything — so the feature is fully backward compatible.
+
+Filtering is **enforcement, not cosmetics**: out-of-scope servers are absent
+from `retrieve_tools` results, hidden from `upstream_servers list`, excluded
+from `code_execution`, and `call_tool_*` refuses them with
+`server '<name>' is out of scope for this session`.
+
+**Setting tags**
+
+```jsonc
+{
+  "name": "fs",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"],
+  "tags": ["halo"]
+}
+```
+
+Via the CLI (repeatable `--tag`):
+
+```bash
+mcpproxy upstream add fs --tag halo -- npx -y @modelcontextprotocol/server-filesystem /path
+```
+
+Via the `upstream_servers` MCP tool: pass `tags_json` (a JSON array string) on
+the `add`/`update` operations. Via REST: include a `tags` array on
+`POST`/`PATCH /api/v1/servers`. Tags are shown as chips on the web-UI server
+list and returned on the servers API and in `upstream_servers list`.
+
+**Making tags mandatory**
+
+Set `require_server_tags: true` (see [Security Settings](#security-settings))
+to reject any registration that supplies no tags — this forces every add to
+declare a scope. Servers already in the config from before the flag was enabled
+are not rejected; instead a loud warning listing them is logged at startup.
 
 ---
 

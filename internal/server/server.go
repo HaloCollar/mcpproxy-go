@@ -36,6 +36,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/security/scanner"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tagscope"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/telemetry"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tlslocal"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
@@ -1091,6 +1092,16 @@ func (s *Server) AddServer(ctx context.Context, serverConfig *config.ServerConfi
 		zap.Bool("enabled", serverConfig.Enabled),
 		zap.Bool("quarantined", serverConfig.Quarantined))
 
+	// Option B: normalize scope tags and enforce require_server_tags. This is
+	// the management chokepoint for REST/CLI-daemon adds, so the policy is
+	// applied here regardless of how the request arrived.
+	serverConfig.Tags = config.NormalizeTags(serverConfig.Tags)
+	if cfg := s.runtime.Config(); cfg != nil {
+		if err := config.ValidateServerTagRequirement(cfg.RequireServerTags, serverConfig.Name, serverConfig.Tags); err != nil {
+			return err
+		}
+	}
+
 	// Check if server already exists
 	storageManager := s.runtime.StorageManager()
 	existing, err := storageManager.GetUpstreamServer(serverConfig.Name)
@@ -1186,6 +1197,12 @@ func (s *Server) UpdateServer(ctx context.Context, serverName string, updates *c
 	existing.Enabled = updates.Enabled
 	existing.Quarantined = updates.Quarantined
 	existing.ReconnectOnUse = updates.ReconnectOnUse
+
+	// Option B: a non-nil Tags slice replaces the scope tag set (nil = leave
+	// untouched, matching the other slice fields above).
+	if updates.Tags != nil {
+		existing.Tags = config.NormalizeTags(updates.Tags)
+	}
 
 	// AutoApproveToolChanges is a tri-state *bool (MCP-2940): nil means
 	// "leave unchanged" so callers that don't touch it (e.g. config-to-secret)
@@ -1662,6 +1679,30 @@ func (s *Server) profileMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// tagScopeMiddleware resolves the per-session tag scope from the `?tags=`
+// query parameter on the /mcp endpoint (Option B — per-upstream tags). When
+// the client declares tags, it injects a tagscope.TagScope (resolved against
+// the current config snapshot: untagged/general servers plus tagged servers
+// whose tags intersect the request) into the request context so retrieve_tools
+// filters and call_tool_* refuses out-of-scope servers. A request without
+// `?tags=` carries no scope and sees everything — preserving pre-feature
+// behaviour byte-for-byte.
+func (s *Server) tagScopeMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested := tagscope.ParseTagsParam(r.URL.Query()["tags"])
+		if len(requested) == 0 {
+			// No scope declared — do not filter (backward compatible).
+			next.ServeHTTP(w, r)
+			return
+		}
+		cfg := s.runtime.Config()
+		allowed := cfg.ServersMatchingTags(requested)
+		scope := tagscope.NewTagScope(requested, allowed)
+		ctx := tagscope.WithTagScope(r.Context(), scope)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // startCustomHTTPServer creates a custom HTTP server that handles MCP endpoints
 // It supports both TCP (for browsers) and Unix socket/named pipe (for tray) listeners
 func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *server.StreamableHTTPServer) error {
@@ -1764,8 +1805,10 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	}
 
 	// Standard MCP endpoint according to the specification
-	// Wrap with auth middleware to inject AuthContext for agent token scope enforcement
-	mcpHandler := s.mcpAuthMiddleware(loggingHandler(streamableServer))
+	// Wrap with auth middleware to inject AuthContext for agent token scope enforcement.
+	// tagScopeMiddleware resolves the optional `?tags=` per-session scope; it runs
+	// after auth so tag scope composes with (independently of) agent-token scope.
+	mcpHandler := s.mcpAuthMiddleware(s.tagScopeMiddleware(loggingHandler(streamableServer)))
 	mux.Handle("/mcp", mcpHandler)
 	mux.Handle("/mcp/", mcpHandler) // Handle trailing slash
 
@@ -1773,19 +1816,19 @@ func (s *Server) startCustomHTTPServer(ctx context.Context, streamableServer *se
 	// Each endpoint always serves its specific routing mode regardless of config.
 	// /mcp/all → direct mode (all tools with serverName__toolName naming)
 	directStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeDirect))
-	directHandler := s.mcpAuthMiddleware(loggingHandler(directStreamable))
+	directHandler := s.mcpAuthMiddleware(s.tagScopeMiddleware(loggingHandler(directStreamable)))
 	mux.Handle("/mcp/all", directHandler)
 	mux.Handle("/mcp/all/", directHandler)
 
 	// /mcp/code → code_execution mode (JS orchestration)
 	codeExecStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeCodeExecution))
-	codeExecHandler := s.mcpAuthMiddleware(loggingHandler(codeExecStreamable))
+	codeExecHandler := s.mcpAuthMiddleware(s.tagScopeMiddleware(loggingHandler(codeExecStreamable)))
 	mux.Handle("/mcp/code", codeExecHandler)
 	mux.Handle("/mcp/code/", codeExecHandler)
 
 	// /mcp/call → retrieve_tools mode (focused: retrieve_tools + call_tool_read/write/destructive)
 	callToolStreamable := server.NewStreamableHTTPServer(s.mcpProxy.GetMCPServerForMode(config.RoutingModeRetrieveTools))
-	callToolHandler := s.mcpAuthMiddleware(loggingHandler(callToolStreamable))
+	callToolHandler := s.mcpAuthMiddleware(s.tagScopeMiddleware(loggingHandler(callToolStreamable)))
 	mux.Handle("/mcp/call", callToolHandler)
 	mux.Handle("/mcp/call/", callToolHandler)
 
