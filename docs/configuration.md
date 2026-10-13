@@ -444,7 +444,7 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
 | `disable_management` | boolean | `false` | Disable server management operations (restart, enable, disable) |
 | `allow_server_add` | boolean | `true` | Allow adding new servers via API/tools |
 | `allow_server_remove` | boolean | `true` | Allow removing servers via API/tools |
-| `require_server_tags` | boolean | `false` | When `true`, registering an upstream without at least one tag is rejected (CLI `upstream add`, the REST add path, and the `upstream_servers` add tool). Pre-existing untagged servers are not rejected on load — they are logged as a startup warning. See [Server Scope Tags](#server-scope-tags). |
+| `require_server_tags` | boolean | `false` | When `true`, registering an upstream without at least one tag is rejected (CLI `upstream add`, the REST add path, and the `upstream_servers` add tool), and so is an update/patch that clears a server's tags. Pre-existing untagged servers are not rejected on load — they are logged as a startup warning. See [Server Scope Tags](#server-scope-tags). |
 
 **Security Notes:**
 - **API Key**: Set via `--api-key` flag, `MCPPROXY_API_KEY` environment variable, or config file
@@ -472,10 +472,21 @@ don't want every client to reach every server.
   `.../mcp?tags=halo,shared`. A connection **without** `?tags=` declares no
   scope and sees everything — so the feature is fully backward compatible.
 
-Filtering is **enforcement, not cosmetics**: out-of-scope servers are absent
-from `retrieve_tools` results, hidden from `upstream_servers list`, excluded
-from `code_execution`, and `call_tool_*` refuses them with
-`server '<name>' is out of scope for this session`.
+Within a scoped session the filtering is enforced on every tool surface:
+out-of-scope servers are absent from `retrieve_tools` results, from the
+direct-mode tool list (`/mcp/all`, `serverName__toolName` tools) and from
+`upstream_servers list` / `quarantine_security list_quarantined`; they are
+excluded from `code_execution`; and `call_tool_*`, direct-mode calls, and every
+other `upstream_servers` / `quarantine_security` operation that names them
+refuse with `server '<name>' is out of scope for this session`. A scoped session
+can `add` a new server but cannot overwrite an existing out-of-scope one.
+
+> **Scope is client self-restriction, not an authentication boundary.** The
+> scope binds a client only because its configured URL carries `?tags=`; any
+> caller with the same access can omit the parameter (or send an empty one)
+> and see every server. To enforce per-client limits against an untrusted
+> caller, use agent tokens (`require_mcp_auth` + scoped `mcp_agt_` tokens).
+> Profile URLs (`/mcp/p/<slug>`) do not evaluate `?tags=`.
 
 **Setting tags**
 

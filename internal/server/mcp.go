@@ -2639,6 +2639,13 @@ func (p *MCPProxyServer) handleUpstreamServers(ctx context.Context, request mcp.
 		}
 	}
 
+	// Option B: a tag-scoped session may only manage servers inside its scope
+	// (list is filtered by the handler; add may not overwrite an out-of-scope server).
+	if msg := p.tagScopeManagementBlock(ctx, operation, request.GetString("name", "")); msg != "" {
+		p.emitActivityInternalToolCall("upstream_servers", "", "", "", sessionID, requestID, "error", msg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		return mcp.NewToolResultError(msg), nil
+	}
+
 	// Spec 028: Agent tokens can only list servers (filtered to allowed) — block all write operations
 	if authCtx := auth.AuthContextFromContext(ctx); authCtx != nil && !authCtx.IsAdmin() {
 		switch operation {
@@ -2736,6 +2743,13 @@ func (p *MCPProxyServer) handleQuarantineSecurity(ctx context.Context, request m
 		errMsg := "Agent tokens cannot perform quarantine security operations"
 		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", errMsg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
 		return mcp.NewToolResultError(errMsg), nil
+	}
+
+	// Option B: a tag-scoped session may only inspect or change quarantine state
+	// of servers inside its scope (list_quarantined is filtered by the handler).
+	if msg := p.tagScopeManagementBlock(ctx, operation, request.GetString("name", "")); msg != "" {
+		p.emitActivityInternalToolCall("quarantine_security", "", "", "", sessionID, requestID, "error", msg, time.Since(startTime).Milliseconds(), args, nil, nil, "")
+		return mcp.NewToolResultError(msg), nil
 	}
 
 	// Security checks
@@ -3420,10 +3434,21 @@ func (p *MCPProxyServer) getDockerContainerInfo(client *managed.Client) map[stri
 	return result
 }
 
-func (p *MCPProxyServer) handleListQuarantinedUpstreams(_ context.Context) (*mcp.CallToolResult, error) {
+func (p *MCPProxyServer) handleListQuarantinedUpstreams(ctx context.Context) (*mcp.CallToolResult, error) {
 	servers, err := p.storage.ListQuarantinedUpstreamServers()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list quarantined upstreams: %v", err)), nil
+	}
+
+	// Option B: hide quarantined servers outside the session's tag scope.
+	if tagScope := tagscope.TagScopeFromContext(ctx); tagScope != nil {
+		filtered := servers[:0:0]
+		for _, s := range servers {
+			if s != nil && tagScope.Allows(s.Name) {
+				filtered = append(filtered, s)
+			}
+		}
+		servers = filtered
 	}
 
 	jsonResult, err := json.Marshal(map[string]interface{}{
@@ -4160,6 +4185,11 @@ func (p *MCPProxyServer) handleUpdateUpstream(ctx context.Context, request mcp.C
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to merge config: %v", err)), nil
 	}
 
+	// Option B: require_server_tags must also hold when a patch changes tags.
+	if err := p.validatePatchedTags(patch, mergedServer); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	// Log the config diff for audit trail (FR-006)
 	if configDiff != nil && !configDiff.IsEmpty() {
 		p.logger.Info("Server config updated via MCP tool",
@@ -4267,6 +4297,11 @@ func (p *MCPProxyServer) handlePatchUpstream(_ context.Context, request mcp.Call
 	mergedServer, configDiff, err := config.MergeServerConfig(existingServer, patch, mergeOpts)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to merge config: %v", err)), nil
+	}
+
+	// Option B: require_server_tags must also hold when a patch changes tags.
+	if err := p.validatePatchedTags(patch, mergedServer); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Log the config diff for audit trail (FR-006)

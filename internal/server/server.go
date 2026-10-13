@@ -1202,6 +1202,13 @@ func (s *Server) UpdateServer(ctx context.Context, serverName string, updates *c
 	// untouched, matching the other slice fields above).
 	if updates.Tags != nil {
 		existing.Tags = config.NormalizeTags(updates.Tags)
+		// require_server_tags must also hold on update: clearing the tags would
+		// make the server visible to every session.
+		if cfg := s.runtime.Config(); cfg != nil {
+			if err := config.ValidateServerTagRequirement(cfg.RequireServerTags, existing.Name, existing.Tags); err != nil {
+				return err
+			}
+		}
 	}
 
 	// AutoApproveToolChanges is a tri-state *bool (MCP-2940): nil means

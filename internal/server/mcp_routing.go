@@ -15,6 +15,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/tagscope"
 )
 
 const (
@@ -130,6 +131,11 @@ func (p *MCPProxyServer) buildDirectModeTools() []mcpserver.ServerTool {
 func (p *MCPProxyServer) makeDirectModeHandler(serverName, toolName string, annotations *config.ToolAnnotations) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		startTime := time.Now()
+
+		// Option B: refuse direct calls to servers outside the session's tag scope.
+		if tagScope := tagscope.TagScopeFromContext(ctx); tagScope != nil && !tagScope.Allows(serverName) {
+			return mcp.NewToolResultError(tagScopeOutOfScopeMessage(tagScope, serverName)), nil
+		}
 
 		// Check auth context for server access and permissions
 		authCtx := auth.AuthContextFromContext(ctx)
@@ -517,6 +523,8 @@ func (p *MCPProxyServer) initRoutingModeServers() {
 	directOpts = append(directOpts,
 		mcpserver.WithToolFilter(p.filterDirectModeToolsForAuth),
 		mcpserver.WithToolFilter(p.filterDirectToolsForAgentCallability),
+		// Option B: hide direct tools of servers outside the session's tag scope.
+		mcpserver.WithToolFilter(p.filterDirectToolsForTagScope),
 	)
 	p.directServer = mcpserver.NewMCPServer(
 		"mcpproxy-go",
