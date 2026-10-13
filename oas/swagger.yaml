@@ -155,6 +155,16 @@ components:
         require_mcp_auth:
           description: 'Require authentication on /mcp endpoint (default: false)'
           type: boolean
+        require_server_tags:
+          description: |-
+            RequireServerTags, when true, rejects any attempt to register an upstream
+            server without at least one tag (CLI `upstream add`, the management REST
+            add path, and the `upstream_servers` add MCP tool). Default false so
+            upstream/other mcpproxy users see no behaviour change. Pre-existing
+            untagged servers already in the config are NOT rejected on load — they are
+            logged loudly as a warning so the operator can tag them — so enabling this
+            never prevents the daemon from starting.
+          type: boolean
         reveal_secret_headers:
           description: |-
             RevealSecretHeaders, when true, disables the redaction of sensitive
@@ -193,17 +203,25 @@ components:
           type: string
         tool_output_max_bytes:
           description: |-
-            ToolOutputMaxBytes caps the size of a single save_to_file write (Spec 076).
-            0 means "use the built-in default" (50 MiB); negative values are a config error.
+            ToolOutputMaxBytes caps the size of a single save_to_file write. 0 (the
+            default) means "use the built-in default" (50 MiB); negative values are
+            a config error. See internal/outputfile.Write.
           type: integer
         tool_output_roots:
           description: |-
             ToolOutputRoots is the whitelist of absolute directory prefixes the
-            save_to_file parameter on call_tool_read/write/destructive is allowed
-            to write under (Spec 076). Empty (the default) disables the feature.
+            `save_to_file` parameter on call_tool_read/write/destructive is allowed
+            to write under (Spec 076).
+            Empty (the default) disables the feature entirely — call_tool_* returns
+            a "save_to_file is disabled" error for any save_to_file request. Each
+            entry must be an absolute path (validated in ValidateDetailed) and is
+            stored filepath.Clean'ed; entries need not exist at startup — they are
+            resolved (including symlinks) at the time of each save_to_file call, in
+            internal/outputfile.
           items:
             type: string
           type: array
+          uniqueItems: false
         tool_response_limit:
           type: integer
         tool_response_session_risk_warning:
@@ -757,6 +775,18 @@ components:
             informational (MCP-1072) — surfaced so a reviewer can see a server's origin
             — and no longer gates quarantine or skip_quarantine.
           type: string
+        tags:
+          description: |-
+            Tags scope an upstream server to particular client sessions. A server
+            with no tags is "general" and visible to every client; a tagged server
+            is only visible to sessions whose declared scope (the `?tags=` query on
+            the /mcp endpoint) intersects its tags. Empty/omitted preserves the
+            pre-feature behaviour (server visible to all). See the `require_server_tags`
+            global knob to make tagging mandatory at registration time.
+          items:
+            type: string
+          type: array
+          uniqueItems: false
         tool_discovery_interval:
           type: string
         updated:
@@ -1920,6 +1950,16 @@ components:
           type: string
         status:
           type: string
+        tags:
+          description: |-
+            Tags are the per-upstream scope tags (Option B). Empty/omitted means the
+            server is "general" and visible to every client session; tagged servers
+            are only visible to sessions whose `?tags=` scope intersects these. Shown
+            as chips on the servers list in the web UI.
+          items:
+            type: string
+          type: array
+          uniqueItems: false
         token_expires_at:
           description: When the OAuth token expires (ISO 8601)
           type: string
@@ -2295,6 +2335,14 @@ components:
           type: boolean
         reconnect_on_use:
           type: boolean
+        tags:
+          description: |-
+            Tags scope the server to client sessions (Option B). On POST (add) a
+            non-empty array sets the tag set; on PATCH a non-nil array replaces it.
+          items:
+            type: string
+          type: array
+          uniqueItems: false
         url:
           type: string
         working_dir:
