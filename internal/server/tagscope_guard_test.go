@@ -41,6 +41,16 @@ func TestFilterDirectToolsForTagScope(t *testing.T) {
 	})
 }
 
+func TestFilterDirectToolsForTagScope_ServerNameWithSeparator(t *testing.T) {
+	// Server "a__b" (out of scope) exposes tool "x" as "a__b__x"; parsing the
+	// first "__" would wrongly attribute it to in-scope server "a".
+	p := &MCPProxyServer{}
+	p.setDirectToolServers(map[string]string{"a__b__x": "a__b", "a__y": "a"})
+	got := p.filterDirectToolsForTagScope(scopedCtx("a"), []mcp.Tool{{Name: "a__b__x"}, {Name: "a__y"}})
+	require.Len(t, got, 1)
+	assert.Equal(t, "a__y", got[0].Name)
+}
+
 func TestDirectModeHandler_RefusesOutOfScopeServer(t *testing.T) {
 	p := &MCPProxyServer{}
 	h := p.makeDirectModeHandler("personal", "secret", nil)

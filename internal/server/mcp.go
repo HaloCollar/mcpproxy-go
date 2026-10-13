@@ -142,6 +142,10 @@ type MCPProxyServer struct {
 	// tokens; execution-time authorization remains authoritative.
 	directToolPermsMu sync.RWMutex
 	directToolPerms   map[string]string
+	// directToolServers maps direct-mode tool names to the REAL upstream server
+	// name (guarded by directToolPermsMu). Server names may contain "__", so the
+	// tag-scope list filter must not re-parse the server from the tool name.
+	directToolServers map[string]string
 
 	// Spec 049: in-memory only counter of retrieve_tools calls that opted into
 	// include_disabled. Never persisted (privacy, consistent with Spec 042).

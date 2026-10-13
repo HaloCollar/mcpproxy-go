@@ -50,15 +50,18 @@ func (p *MCPProxyServer) buildDirectModeTools() []mcpserver.ServerTool {
 	tools, err := p.upstreamManager.DiscoverTools(ctx)
 	if err != nil {
 		p.setDirectToolPermissions(nil)
+		p.setDirectToolServers(nil)
 		p.logger.Error("failed to discover tools for direct mode", zap.Error(err))
 		return nil
 	}
 
 	serverTools := make([]mcpserver.ServerTool, 0, len(tools))
 	directToolPerms := make(map[string]string, len(tools))
+	directToolServers := make(map[string]string, len(tools))
 	for _, tool := range tools {
 		directName := FormatDirectToolName(tool.ServerName, tool.Name)
 		directToolPerms[directName] = requiredPermissionForDirectTool(tool.Annotations)
+		directToolServers[directName] = tool.ServerName
 
 		// Build MCP tool options
 		opts := []mcp.ToolOption{
@@ -119,6 +122,7 @@ func (p *MCPProxyServer) buildDirectModeTools() []mcpserver.ServerTool {
 	}
 
 	p.setDirectToolPermissions(directToolPerms)
+	p.setDirectToolServers(directToolServers)
 
 	p.logger.Info("built direct mode tools",
 		zap.Int("tool_count", len(serverTools)))

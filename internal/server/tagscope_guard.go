@@ -25,17 +25,45 @@ func (p *MCPProxyServer) filterDirectToolsForTagScope(ctx context.Context, tools
 	}
 	filtered := make([]mcp.Tool, 0, len(tools))
 	for _, tool := range tools {
-		serverName, _, ok := ParseDirectToolName(tool.Name)
+		serverName, ok := p.lookupDirectToolServer(tool.Name)
 		if !ok {
-			// Not a direct upstream tool; nothing to scope.
-			filtered = append(filtered, tool)
-			continue
+			// Not registered as a direct upstream tool. Fall back to parsing;
+			// a name that does not parse is not an upstream tool at all.
+			parsed, _, parsedOK := ParseDirectToolName(tool.Name)
+			if !parsedOK {
+				filtered = append(filtered, tool)
+				continue
+			}
+			serverName = parsed
 		}
 		if scope.Allows(serverName) {
 			filtered = append(filtered, tool)
 		}
 	}
 	return filtered
+}
+
+// setDirectToolServers records the direct tool name -> real server name map.
+func (p *MCPProxyServer) setDirectToolServers(servers map[string]string) {
+	p.directToolPermsMu.Lock()
+	defer p.directToolPermsMu.Unlock()
+	if len(servers) == 0 {
+		p.directToolServers = nil
+		return
+	}
+	copied := make(map[string]string, len(servers))
+	for k, v := range servers {
+		copied[k] = v
+	}
+	p.directToolServers = copied
+}
+
+// lookupDirectToolServer returns the real upstream server of a direct tool.
+func (p *MCPProxyServer) lookupDirectToolServer(directName string) (string, bool) {
+	p.directToolPermsMu.RLock()
+	defer p.directToolPermsMu.RUnlock()
+	s, ok := p.directToolServers[directName]
+	return s, ok
 }
 
 // tagScopeOutOfScopeMessage is the shared refusal text for out-of-scope servers.
@@ -81,7 +109,9 @@ func (p *MCPProxyServer) tagScopeManagementBlock(ctx context.Context, operation,
 }
 
 // upstreamExists reports whether a server with this name is already stored.
-// It fails closed (true) when storage is unavailable.
+// It returns true when storage is unavailable (nil). A lookup error is treated
+// as "not stored", because storage reports not-found as an error; a plain add
+// of a name that truly does not exist cannot widen the session's scope.
 func (p *MCPProxyServer) upstreamExists(name string) bool {
 	if p.storage == nil {
 		return true
