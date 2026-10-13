@@ -1,11 +1,22 @@
 package config
 
 import (
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// osAbs turns a POSIX-style absolute test path into an absolute path for the
+// current OS (on Windows "/tmp/x" is not absolute; it needs a volume).
+func osAbs(p string) string {
+	if runtime.GOOS == "windows" {
+		return `C:` + filepath.FromSlash(p)
+	}
+	return p
+}
 
 func TestValidateDetailed(t *testing.T) {
 	tests := []struct {
@@ -313,7 +324,7 @@ func TestValidateDetailed(t *testing.T) {
 				ToolsLimit:        15,
 				ToolResponseLimit: 1000,
 				CallToolTimeout:   Duration(60000000000),
-				ToolOutputRoots:   []string{"/tmp/mcpproxy-out"},
+				ToolOutputRoots:   []string{osAbs("/tmp/mcpproxy-out")},
 			},
 			expectedErrors: 0,
 			errorFields:    []string{},
@@ -325,7 +336,7 @@ func TestValidateDetailed(t *testing.T) {
 				ToolsLimit:        15,
 				ToolResponseLimit: 1000,
 				CallToolTimeout:   Duration(60000000000),
-				ToolOutputRoots:   []string{"/"},
+				ToolOutputRoots:   []string{osAbs("/")},
 			},
 			expectedErrors: 1,
 			errorFields:    []string{"tool_output_roots"},
@@ -430,11 +441,11 @@ func TestValidate_ToolOutputRootsCleaned(t *testing.T) {
 		ToolsLimit:        15,
 		ToolResponseLimit: 1000,
 		CallToolTimeout:   Duration(60000000000),
-		ToolOutputRoots:   []string{"/tmp/a/../b/"},
+		ToolOutputRoots:   []string{osAbs("/tmp/a/../b/")},
 	}
 	err := cfg.Validate()
 	require.NoError(t, err)
-	assert.Equal(t, []string{"/tmp/b"}, cfg.ToolOutputRoots)
+	assert.Equal(t, []string{osAbs("/tmp/b")}, cfg.ToolOutputRoots)
 }
 
 func TestValidate_ToolOutputRootsFilesystemRootIsLoadError(t *testing.T) {
@@ -442,7 +453,7 @@ func TestValidate_ToolOutputRootsFilesystemRootIsLoadError(t *testing.T) {
 		ToolsLimit:        15,
 		ToolResponseLimit: 1000,
 		CallToolTimeout:   Duration(60000000000),
-		ToolOutputRoots:   []string{"/"},
+		ToolOutputRoots:   []string{osAbs("/")},
 	}
 	err := cfg.Validate()
 	require.Error(t, err)

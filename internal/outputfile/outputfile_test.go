@@ -6,15 +6,32 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// resolveT calls Resolve and registers a cleanup that closes the returned
+// os.Root handle. t.Cleanup runs LIFO, so the handle is closed before any
+// t.TempDir created earlier in the test is removed; on Windows an open
+// directory handle makes that removal (and so the test) fail.
+func resolveT(t *testing.T, roots []string, requested string, overwrite bool) (Target, error) {
+	t.Helper()
+	target, err := Resolve(roots, requested, overwrite)
+	t.Cleanup(func() { _ = target.Close() })
+	return target, err
+}
+
+// unixPermsApply reports whether Unix permission bits are meaningful on this
+// OS. Windows reports synthetic modes (0666/0777), so mode assertions are
+// skipped there.
+func unixPermsApply() bool { return runtime.GOOS != "windows" }
 
 func TestResolve_UnderRootOK(t *testing.T) {
 	root := t.TempDir()
 	requested := filepath.Join(root, "sub", "file.txt")
 
-	got, err := Resolve([]string{root}, requested, false)
+	got, err := resolveT(t, []string{root}, requested, false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil", err)
 	}
@@ -39,7 +56,7 @@ func TestResolve_RootItselfRejected(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "exact-root-file")
 
-	_, err := Resolve([]string{root}, root, false)
+	_, err := resolveT(t, []string{root}, root, false)
 	if !errors.Is(err, ErrInvalidPath) {
 		t.Fatalf("Resolve() error = %v, want ErrInvalidPath", err)
 	}
@@ -53,7 +70,7 @@ func TestResolve_PrefixBoundaryRejected(t *testing.T) {
 	}
 	evil := filepath.Join(base, "proj-evil", "f")
 
-	_, err := Resolve([]string{root}, evil, false)
+	_, err := resolveT(t, []string{root}, evil, false)
 	if !errors.Is(err, ErrOutsideRoots) {
 		t.Fatalf("Resolve() error = %v, want ErrOutsideRoots", err)
 	}
@@ -63,7 +80,7 @@ func TestResolve_DotDotEscapeRejected(t *testing.T) {
 	root := t.TempDir()
 	escaped := filepath.Join(root, "..", "evil", "file.txt")
 
-	_, err := Resolve([]string{root}, escaped, false)
+	_, err := resolveT(t, []string{root}, escaped, false)
 	if !errors.Is(err, ErrOutsideRoots) {
 		t.Fatalf("Resolve() error = %v, want ErrOutsideRoots", err)
 	}
@@ -79,7 +96,7 @@ func TestResolve_SymlinkedDirectoryInsideRootEscapes(t *testing.T) {
 	}
 
 	requested := filepath.Join(link, "file.txt")
-	_, err := Resolve([]string{root}, requested, false)
+	_, err := resolveT(t, []string{root}, requested, false)
 	if !errors.Is(err, ErrOutsideRoots) {
 		t.Fatalf("Resolve() error = %v, want ErrOutsideRoots", err)
 	}
@@ -94,7 +111,7 @@ func TestResolve_SymlinkedRootAccepted(t *testing.T) {
 	}
 
 	requested := filepath.Join(rootLink, "file.txt")
-	got, err := Resolve([]string{rootLink}, requested, false)
+	got, err := resolveT(t, []string{rootLink}, requested, false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil", err)
 	}
@@ -133,7 +150,7 @@ func TestResolve_RootMissingUnderSymlinkedAncestor(t *testing.T) {
 	root := filepath.Join(link, "out")
 	requested := filepath.Join(root, "f.txt")
 
-	got, err := Resolve([]string{root}, requested, false)
+	got, err := resolveT(t, []string{root}, requested, false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil (root missing under a symlinked ancestor must still resolve)", err)
 	}
@@ -163,7 +180,7 @@ func TestResolve_FinalTargetSymlinkRejected(t *testing.T) {
 		t.Skipf("symlinks unsupported: %v", err)
 	}
 
-	_, err := Resolve([]string{root}, link, true)
+	_, err := resolveT(t, []string{root}, link, true)
 	if !errors.Is(err, ErrInvalidPath) {
 		t.Fatalf("Resolve() error = %v, want ErrInvalidPath (even with save_overwrite=true)", err)
 	}
@@ -171,7 +188,7 @@ func TestResolve_FinalTargetSymlinkRejected(t *testing.T) {
 
 func TestResolve_RelativeRejected(t *testing.T) {
 	root := t.TempDir()
-	_, err := Resolve([]string{root}, "relative/path.txt", false)
+	_, err := resolveT(t, []string{root}, "relative/path.txt", false)
 	if !errors.Is(err, ErrInvalidPath) {
 		t.Fatalf("Resolve() error = %v, want ErrInvalidPath", err)
 	}
@@ -179,7 +196,7 @@ func TestResolve_RelativeRejected(t *testing.T) {
 
 func TestResolve_NULByteRejected(t *testing.T) {
 	root := t.TempDir()
-	_, err := Resolve([]string{root}, root+"/f\x00ile", false)
+	_, err := resolveT(t, []string{root}, root+"/f\x00ile", false)
 	if !errors.Is(err, ErrInvalidPath) {
 		t.Fatalf("Resolve() error = %v, want ErrInvalidPath", err)
 	}
@@ -187,14 +204,14 @@ func TestResolve_NULByteRejected(t *testing.T) {
 
 func TestResolve_EmptyRequestedRejected(t *testing.T) {
 	root := t.TempDir()
-	_, err := Resolve([]string{root}, "", false)
+	_, err := resolveT(t, []string{root}, "", false)
 	if !errors.Is(err, ErrInvalidPath) {
 		t.Fatalf("Resolve() error = %v, want ErrInvalidPath", err)
 	}
 }
 
 func TestResolve_RootsEmptyDisabled(t *testing.T) {
-	_, err := Resolve(nil, "/tmp/whatever", false)
+	_, err := resolveT(t, nil, "/tmp/whatever", false)
 	if !errors.Is(err, ErrDisabled) {
 		t.Fatalf("Resolve() error = %v, want ErrDisabled", err)
 	}
@@ -210,7 +227,7 @@ func TestResolve_ExistsNoOverwriteRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := Resolve([]string{root}, target, false)
+	_, err := resolveT(t, []string{root}, target, false)
 	if !errors.Is(err, ErrExists) {
 		t.Fatalf("Resolve() error = %v, want ErrExists", err)
 	}
@@ -223,7 +240,7 @@ func TestResolve_ExistsOverwriteAccepted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := Resolve([]string{root}, target, true)
+	got, err := resolveT(t, []string{root}, target, true)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil", err)
 	}
@@ -236,7 +253,7 @@ func TestResolve_MissingIntermediateDirsOK(t *testing.T) {
 	root := t.TempDir()
 	requested := filepath.Join(root, "a", "b", "c", "file.txt")
 
-	got, err := Resolve([]string{root}, requested, false)
+	got, err := resolveT(t, []string{root}, requested, false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil", err)
 	}
@@ -253,7 +270,7 @@ func TestResolve_MissingIntermediateDirsOK(t *testing.T) {
 
 func TestWrite_HappyPath(t *testing.T) {
 	root := t.TempDir()
-	target, err := Resolve([]string{root}, filepath.Join(root, "out.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "out.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -288,14 +305,14 @@ func TestWrite_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	if unixPermsApply() && fi.Mode().Perm() != 0o600 {
 		t.Errorf("file mode = %v, want 0600", fi.Mode().Perm())
 	}
 }
 
 func TestWrite_TooLargeLeavesNoFile(t *testing.T) {
 	root := t.TempDir()
-	target, err := Resolve([]string{root}, filepath.Join(root, "out.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "out.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -318,7 +335,7 @@ func TestWrite_TooLargeLeavesNoFile(t *testing.T) {
 // tool_output_max_bytes boundary — exactly at the limit is allowed.
 func TestWrite_ExactlyMaxBytesAllowed(t *testing.T) {
 	root := t.TempDir()
-	target, err := Resolve([]string{root}, filepath.Join(root, "out.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "out.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -339,7 +356,7 @@ func TestWrite_NonPositiveMaxBytesMeansNoLimit(t *testing.T) {
 	data := []byte(strings.Repeat("z", 100000))
 
 	for _, maxBytes := range []int64{0, -1} {
-		target, err := Resolve([]string{root}, filepath.Join(root, "out.txt"), true)
+		target, err := resolveT(t, []string{root}, filepath.Join(root, "out.txt"), true)
 		if err != nil {
 			t.Fatalf("Resolve() error = %v", err)
 		}
@@ -351,7 +368,7 @@ func TestWrite_NonPositiveMaxBytesMeansNoLimit(t *testing.T) {
 
 func TestWrite_MissingIntermediateDirsCreated(t *testing.T) {
 	root := t.TempDir()
-	target, err := Resolve([]string{root}, filepath.Join(root, "a", "b", "c", "out.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "a", "b", "c", "out.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -367,7 +384,7 @@ func TestWrite_MissingIntermediateDirsCreated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o700 {
+	if unixPermsApply() && fi.Mode().Perm() != 0o700 {
 		t.Errorf("dir mode = %v, want 0700", fi.Mode().Perm())
 	}
 }
@@ -375,7 +392,7 @@ func TestWrite_MissingIntermediateDirsCreated(t *testing.T) {
 func TestWrite_OverwriteReplacesContent(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "out.txt")
-	target, err := Resolve([]string{root}, path, false)
+	target, err := resolveT(t, []string{root}, path, false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -383,7 +400,7 @@ func TestWrite_OverwriteReplacesContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	target2, err := Resolve([]string{root}, path, true)
+	target2, err := resolveT(t, []string{root}, path, true)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -437,7 +454,7 @@ func TestWrite_NoOverwriteExistingFails(t *testing.T) {
 
 func TestWrite_NoTempFileLeftOnSuccess(t *testing.T) {
 	root := t.TempDir()
-	target, err := Resolve([]string{root}, filepath.Join(root, "out.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "out.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -473,7 +490,7 @@ func TestWrite_SymlinkInsideRootPlantedAfterResolve(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
 
-	target, err := Resolve([]string{root}, filepath.Join(root, "sub", "f.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "sub", "f.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -525,7 +542,7 @@ func TestWrite_RootItselfSwappedForSymlinkAfterResolve(t *testing.T) {
 	}
 	attacker := t.TempDir()
 
-	target, err := Resolve([]string{root}, filepath.Join(root, "f.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "f.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
@@ -540,6 +557,11 @@ func TestWrite_RootItselfSwappedForSymlinkAfterResolve(t *testing.T) {
 	// already succeeded against the real directory).
 	movedAside := filepath.Join(base, "root-moved-aside")
 	if err := os.Rename(root, movedAside); err != nil {
+		if runtime.GOOS == "windows" {
+			// Windows refuses to rename a directory that has an open handle,
+			// which already defeats this swap.
+			t.Skipf("cannot rename a directory with an open handle on Windows: %v", err)
+		}
 		t.Fatal(err)
 	}
 	if err := os.Symlink(attacker, root); err != nil {
@@ -580,7 +602,7 @@ func TestWrite_RootCreatedWhenMissing(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "not-yet-created")
 
-	target, err := Resolve([]string{root}, filepath.Join(root, "out.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "out.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil (root not existing yet must not be rejected)", err)
 	}
@@ -597,7 +619,7 @@ func TestWrite_RootCreatedWhenMissing(t *testing.T) {
 	if !fi.IsDir() {
 		t.Fatal("root path exists but is not a directory")
 	}
-	if fi.Mode().Perm() != 0o700 {
+	if unixPermsApply() && fi.Mode().Perm() != 0o700 {
 		t.Errorf("root dir mode = %v, want 0700", fi.Mode().Perm())
 	}
 
@@ -625,7 +647,7 @@ func TestWrite_RootCreatedWhenMissingUnderSymlinkedAncestor(t *testing.T) {
 	}
 
 	root := filepath.Join(link, "out") // does not exist yet
-	target, err := Resolve([]string{root}, filepath.Join(root, "f.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "f.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil", err)
 	}
@@ -650,7 +672,7 @@ func TestWrite_RootCreatedWhenMissingUnderSymlinkedAncestor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o700 {
+	if unixPermsApply() && fi.Mode().Perm() != 0o700 {
 		t.Errorf("created root dir mode = %v, want 0700", fi.Mode().Perm())
 	}
 }
@@ -661,7 +683,7 @@ func TestWrite_RootCreatedWhenMissingUnderSymlinkedAncestor(t *testing.T) {
 // without the underlying *PathError text being the only signal.
 func TestWrite_ErrorsWrapSentinels(t *testing.T) {
 	root := t.TempDir()
-	target, err := Resolve([]string{root}, filepath.Join(root, "out.txt"), false)
+	target, err := resolveT(t, []string{root}, filepath.Join(root, "out.txt"), false)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}

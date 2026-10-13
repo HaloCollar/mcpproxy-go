@@ -269,7 +269,7 @@ func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *
 		// authentication succeeded, so it still falls through to the
 		// "Authentication required" verdict below. MCP health-verdict
 		// staleness fix.
-		if (input.OAuthStatus == "none" || input.OAuthStatus == "") && !(input.Connected && input.ToolCount > 0) {
+		if (input.OAuthStatus == "none" || input.OAuthStatus == "") && (!input.Connected || input.ToolCount <= 0) {
 			// Server requires OAuth but no token - needs login
 			return &contracts.HealthStatus{
 				Level:      LevelUnhealthy,
