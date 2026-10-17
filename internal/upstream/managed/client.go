@@ -92,6 +92,13 @@ type Client struct {
 	// falls back to coreClient (hand-constructed clients in tests).
 	healthProbe livenessProber
 
+	// toolInvoker is the tools/call surface CallTool dispatches through. In
+	// production it is the coreClient; the narrow interface lets tests inject a
+	// fake outcome so the call-path error classification (GH #965) is testable
+	// without a live upstream. When nil it falls back to coreClient
+	// (hand-constructed clients in tests).
+	toolInvoker toolCaller
+
 	// oauthCallRequired records that this server connected anonymously (no config
 	// OAuth) but a tools/call returned "authorization required" / 401 — the
 	// endpoint enforces OAuth only at call time (e.g. Google's sqladmin MCP). The
@@ -105,6 +112,12 @@ type Client struct {
 // lightweight MCP `ping` to confirm the connection is alive (spec 074, FR-001).
 type livenessProber interface {
 	Ping(ctx context.Context) error
+}
+
+// toolCaller is the minimal core-client surface CallTool needs. Mirrors
+// livenessProber: production wires the coreClient, tests inject a fake.
+type toolCaller interface {
+	CallTool(ctx context.Context, toolName string, args map[string]interface{}) (*mcp.CallToolResult, error)
 }
 
 // healthCheckFailureThreshold is the number of consecutive transient
@@ -132,6 +145,7 @@ func NewClient(id string, serverConfig *config.ServerConfig, logger *zap.Logger,
 		storage:        storage,
 		stopMonitoring: make(chan struct{}),
 		healthProbe:    coreClient,
+		toolInvoker:    coreClient,
 	}
 	mc.cfg.Store(serverConfig)
 	mc.globalConfig.Store(globalConfig)
@@ -642,11 +656,25 @@ func (mc *Client) CallTool(ctx context.Context, toolName string, args map[string
 		return nil, fmt.Errorf("client not connected (state: %s)", mc.StateManager.GetState().String())
 	}
 
-	result, err := mc.coreClient.CallTool(ctx, toolName, args)
+	invoker := mc.toolInvoker
+	if invoker == nil {
+		invoker = mc.coreClient
+	}
+	result, err := invoker.CallTool(ctx, toolName, args)
 	if err != nil {
 		mc.recordCallToolOAuthSignal(toolName, err)
-		// Check if it's a connection error and update state
-		if mc.isConnectionError(err) {
+		// GH #965: a canceled or timed-out CALL is not a dead SERVER. When the
+		// caller's own context is done (client hung up, per-request deadline),
+		// the failure is call-scoped by definition — never touch server state.
+		// SetError would flip the whole upstream to Error, burn a retry and
+		// evict it for every other client.
+		if ctx.Err() != nil {
+			mc.logger.Warn("Tool call canceled/deadline by caller; not marking server unhealthy",
+				zap.String("server", mc.GetConfig().Name),
+				zap.String("tool", toolName),
+				zap.Error(ctx.Err()))
+		} else if mc.isConnectionError(err) {
+			// Check if it's a connection error and update state
 			// Use different log levels based on error type
 			if mc.isNormalReconnectionError(err) {
 				mc.logger.Warn("Tool call failed due to connection loss, will attempt reconnection",
