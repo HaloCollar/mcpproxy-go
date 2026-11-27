@@ -1222,6 +1222,7 @@ type AddServerRequest struct {
 	Enabled        *bool             `json:"enabled,omitempty"`
 	Quarantined    *bool             `json:"quarantined,omitempty"`
 	ReconnectOnUse *bool             `json:"reconnect_on_use,omitempty"`
+	Tags           []string          `json:"tags,omitempty"`
 }
 
 // AddServerResult represents the result of adding a server.

@@ -1371,6 +1371,56 @@ func TestNewServerQuarantineDefault(t *testing.T) {
 	})
 }
 
+// TestAddServerConfigModeTagsPersisted verifies that scope tags round-trip
+// through a config-file-mode add (Option B).
+func TestAddServerConfigModeTagsPersisted(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "mcp_config.json")
+	initialConfig := `{
+		"listen": "127.0.0.1:8080",
+		"data_dir": "` + jsonEscapePath(tmpDir) + `",
+		"mcpServers": []
+	}`
+	if err := os.WriteFile(configPath, []byte(initialConfig), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := &cliclient.AddServerRequest{
+		Name:     "tagged",
+		URL:      "https://example.com/mcp",
+		Protocol: "http",
+		Tags:     []string{"halo", "personal"},
+	}
+	cfg, err := config.LoadFromFile(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg.DataDir = tmpDir
+
+	// Swallow stdout.
+	oldStdout := os.Stdout
+	_, w, _ := os.Pipe()
+	os.Stdout = w
+	err = runUpstreamAddConfigMode(req, cfg)
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatalf("runUpstreamAddConfigMode() error = %v", err)
+	}
+
+	updated, err := config.LoadFromFile(configPath)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if len(updated.Servers) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(updated.Servers))
+	}
+	tags := updated.Servers[0].Tags
+	if len(tags) != 2 || tags[0] != "halo" || tags[1] != "personal" {
+		t.Fatalf("expected tags [halo personal], got %v", tags)
+	}
+}
+
 // T021: Test that CLI prints request_id on error
 func TestOutputError_WithRequestID(t *testing.T) {
 	t.Run("prints request_id when APIError has one", func(t *testing.T) {

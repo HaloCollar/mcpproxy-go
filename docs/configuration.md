@@ -96,6 +96,86 @@ MCPProxy looks for configuration in these locations (in order):
 | `tool_response_limit` | integer | `20000` | Maximum characters in tool responses (0 = unlimited) |
 | `call_tool_timeout` | string | `"2m"` | Timeout for tool calls (e.g., `"30s"`, `"2m"`, `"5m"`). **Note**: When using agents like Codex or Claude as MCP servers, you may need to increase this timeout significantly, even up to 10 minutes (`"10m"`), as these agents may require longer processing times for complex operations |
 
+### Save Tool Output to File
+
+`call_tool_read` / `call_tool_write` / `call_tool_destructive` accept an
+optional `save_to_file` parameter: instead of returning the (possibly
+`tool_response_limit`-truncated) response body, mcpproxy writes the **full,
+untruncated** upstream response to a file and returns a short JSON envelope
+(`saved_to`, `bytes`, `sha256`, `format`, `content_blocks`, `non_text_blocks`,
+`preview`, `truncated_preview`) instead. This is disabled by default —
+`save_to_file` requests are rejected until `tool_output_roots` is configured.
+
+```json
+{
+  "tool_output_roots": ["/Users/me/mcpproxy-out"],
+  "tool_output_max_bytes": 52428800
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tool_output_roots` | array of strings | `[]` (disabled) | Absolute directory paths `save_to_file` is allowed to write under. Each path must be absolute — a relative entry fails config validation. Symlinked roots are resolved once at request time, so pointing a root at (e.g.) a symlinked temp directory works as expected. Configured in the JSON config file only — there is no Settings-UI field for it, since the UI's free-text controls bind a plain string with no array coercion and would corrupt the list on save. The matched root directory (and any missing ancestor directories) is created `0700` on first use as soon as a request matches it, even if that request is ultimately rejected for an unrelated reason (e.g. the response is too large) — a rejected request can still leave an empty root directory behind. |
+| `tool_output_max_bytes` | integer | `52428800` (50 MiB) | Maximum size, in bytes, of a single `save_to_file` write. A request that would exceed this is rejected and no file is left behind. |
+
+**Security notes:**
+- Every `save_to_file` path is resolved against `tool_output_roots` with
+  symlink-safe, separator-bounded prefix matching — `/root/proj` cannot be
+  satisfied by a sibling path like `/root/proj-evil`, and a symlink that
+  would walk the resolved path back outside every configured root is
+  rejected (`ErrOutsideRoots`), as is a symlink sitting at the final target
+  path itself (`ErrInvalidPath`). The write itself is then confined to the
+  matched root via a single `*os.Root` handle opened once, immediately after
+  the root is resolved — every filesystem operation the write performs
+  (creating parent directories, writing the temp file, renaming into place)
+  goes through that one handle, never through a path string again. This
+  closes a symlink or rename planted **inside** the root between the
+  resolve step and the write, and any replacement of the root directory (or
+  its ancestors) **after** the handle is open — once the handle is open, a
+  later swap of the root's own path cannot move it. It does **not** close a
+  race that replaces an **ancestor** of a configured root in the
+  microseconds between mcpproxy resolving that ancestor's symlinks and
+  opening the root — ancestors of a configured root are admin-controlled,
+  and a same-user process able to win that race could already write
+  anywhere the mcpproxy process can.
+- Directory components under a root must be real directories — if any path
+  component `save_to_file` would need to create or traverse is itself a
+  symlink, the write fails (surfaced as a plain filesystem error, e.g.
+  `mkdirat sub: file exists`) rather than following it. This is a byproduct
+  of the same `os.Root`-based confinement, not a separate check.
+- Root matching is **case-sensitive**, independent of the underlying
+  filesystem's own case sensitivity — on a case-insensitive filesystem (e.g.
+  default macOS/Windows volumes), configure `tool_output_roots` using the
+  same casing your `save_to_file` requests will use, since `/Root/proj` and
+  `/root/proj` are treated as different, non-matching prefixes even though
+  the filesystem itself would resolve them to the same directory.
+- Saved files are written `0600` (owner read/write only) and any directories
+  `save_to_file` creates under a root are `0700` (owner-only).
+- Writes are atomic (temp file in the destination directory, `fsync`d, then
+  renamed into place) and default to **not overwriting** an existing file —
+  pass `"save_overwrite": true` explicitly to replace one.
+- A `save_to_file` request against an upstream response that itself came
+  back as an error is never honored — errors are always returned inline so
+  they stay visible to the caller.
+- A save failure that isn't caught before dispatch — an outside-roots
+  path, an existing file without `save_overwrite`, or a response over
+  `tool_output_max_bytes` — occurs **after** the upstream tool has already
+  executed, and by design the response body is then not returned inline as
+  a fallback; the caller explicitly asked for a file, so the failure is
+  always reported as a tool error, never silently forwarded inline.
+- The redaction pipeline (`applyOutputSanitisation`, secret-stripping) still
+  runs on the response **before** it is saved, so a saved file never contains
+  a secret that redaction would otherwise have stripped. Output-schema
+  validation (strict-mode blocking against a tool's declared output schema)
+  and response spotlighting do **not** run on a saved response at all — the
+  file on disk holds the full, un-spotlighted upstream text as redaction
+  left it. An agent that reads a saved file back must treat its contents as
+  untrusted data, the same as any other unvalidated tool output.
+- Saving to file does not remove the response body from tool-call history —
+  the full upstream response is still persisted to the tool-call record
+  (BoltDB) on a saved call exactly as it is for any other call, so the
+  existing history retention/redaction rules apply unchanged.
+
 ### Discovery & Health Checks
 
 mcpproxy keeps each upstream connection alive and its tool index fresh with two
@@ -213,6 +293,7 @@ the proxy.
 | `enabled` | boolean | No | Enable/disable server (default: `true`) |
 | `quarantined` | boolean | No | Security quarantine status (default: `false` for manually added servers, `true` for LLM-added servers) |
 | `reconnect_on_use` | boolean | No | When `true`, tool calls to a disconnected server trigger an immediate reconnect attempt (15s timeout) before failing (default: `false`) |
+| `tags` | array | No | Scope tags for this server (see [Server Scope Tags](#server-scope-tags)). A server with no tags is *general* and visible to every client; a tagged server is only visible to client sessions whose declared scope intersects its tags. |
 | `created` | string | No | ISO 8601 timestamp (auto-generated) |
 | `updated` | string | No | ISO 8601 timestamp (auto-updated) |
 
@@ -351,7 +432,8 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
   "read_only_mode": false,
   "disable_management": false,
   "allow_server_add": true,
-  "allow_server_remove": true
+  "allow_server_remove": true,
+  "require_server_tags": false
 }
 ```
 
@@ -362,12 +444,78 @@ See [OAuth Documentation](mcp-go-oauth.md) for complete details.
 | `disable_management` | boolean | `false` | Disable server management operations (restart, enable, disable) |
 | `allow_server_add` | boolean | `true` | Allow adding new servers via API/tools |
 | `allow_server_remove` | boolean | `true` | Allow removing servers via API/tools |
+| `require_server_tags` | boolean | `false` | When `true`, registering an upstream without at least one tag is rejected (CLI `upstream add`, the REST add path, and the `upstream_servers` add tool), and so is an update/patch that clears a server's tags. Pre-existing untagged servers are not rejected on load — they are logged as a startup warning. See [Server Scope Tags](#server-scope-tags). |
 
 **Security Notes:**
 - **API Key**: Set via `--api-key` flag, `MCPPROXY_API_KEY` environment variable, or config file
 - **Empty API Key**: Empty values are replaced with an auto-generated key; authentication is always enforced
 - **Auto-Generation**: If no API key is provided, one is generated and logged for easy access
 - **Tray Integration**: Tray app automatically manages API keys for core communication
+
+---
+
+## Server Scope Tags
+
+Scope tags let you restrict which upstream servers a given MCP client session
+can see and call, without running multiple mcpproxy instances. This is useful
+when one proxy aggregates servers that belong to different projects and you
+don't want every client to reach every server.
+
+**Model**
+
+- Each server may carry a `tags` array. A server with **no tags** is *general*
+  and visible to **every** client session.
+- A tagged server is visible **only** to sessions whose declared scope
+  intersects the server's tags (case-insensitive).
+- A client declares its scope with a `?tags=` query parameter on the MCP
+  endpoint URL, e.g. `http://127.0.0.1:8080/mcp?tags=halo` or
+  `.../mcp?tags=halo,shared`. A connection **without** `?tags=` declares no
+  scope and sees everything — so the feature is fully backward compatible.
+
+Within a scoped session the filtering is enforced on every tool surface:
+out-of-scope servers are absent from `retrieve_tools` results, from the
+direct-mode tool list (`/mcp/all`, `serverName__toolName` tools) and from
+`upstream_servers list` / `quarantine_security list_quarantined`; they are
+excluded from `code_execution`; and `call_tool_*`, direct-mode calls, and every
+other `upstream_servers` / `quarantine_security` operation that names them
+refuse with `server '<name>' is out of scope for this session`. A scoped session
+can `add` a new server but cannot overwrite an existing out-of-scope one.
+
+> **Scope is client self-restriction, not an authentication boundary.** The
+> scope binds a client only because its configured URL carries `?tags=`; any
+> caller with the same access can omit the parameter (or send an empty one)
+> and see every server. To enforce per-client limits against an untrusted
+> caller, use agent tokens (`require_mcp_auth` + scoped `mcp_agt_` tokens).
+> Profile URLs (`/mcp/p/<slug>`) do not evaluate `?tags=`.
+
+**Setting tags**
+
+```jsonc
+{
+  "name": "fs",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"],
+  "tags": ["halo"]
+}
+```
+
+Via the CLI (repeatable `--tag`):
+
+```bash
+mcpproxy upstream add fs --tag halo -- npx -y @modelcontextprotocol/server-filesystem /path
+```
+
+Via the `upstream_servers` MCP tool: pass `tags_json` (a JSON array string) on
+the `add`/`update` operations. Via REST: include a `tags` array on
+`POST`/`PATCH /api/v1/servers`. Tags are shown as chips on the web-UI server
+list and returned on the servers API and in `upstream_servers list`.
+
+**Making tags mandatory**
+
+Set `require_server_tags: true` (see [Security Settings](#security-settings))
+to reject any registration that supplies no tags — this forces every add to
+declare a scope. Servers already in the config from before the flag was enabled
+are not rejected; instead a loud warning listing them is logged at startup.
 
 ---
 
@@ -982,6 +1130,8 @@ Here's a complete configuration example with all major sections:
   "api_key": "",
   "tools_limit": 15,
   "tool_response_limit": 20000,
+  "tool_output_roots": [],
+  "tool_output_max_bytes": 52428800,
   "call_tool_timeout": "2m",
   "debug_search": false,
   "enable_prompts": true,

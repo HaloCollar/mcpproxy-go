@@ -53,6 +53,11 @@ type Server struct {
 	Health            *HealthStatus      `json:"health,omitempty"`           // Unified health status calculated by the backend
 	Quarantine        *QuarantineStats   `json:"quarantine,omitempty"`       // Tool quarantine metrics for this server
 	ReconnectOnUse    bool               `json:"reconnect_on_use,omitempty"` // Attempt reconnection when a tool call targets this disconnected server
+	// Tags are the per-upstream scope tags (Option B). Empty/omitted means the
+	// server is "general" and visible to every client session; tagged servers
+	// are only visible to sessions whose `?tags=` scope intersects these. Shown
+	// as chips on the servers list in the web UI.
+	Tags []string `json:"tags,omitempty"`
 	// AutoApproveToolChanges mirrors config.ServerConfig.AutoApproveToolChanges
 	// (MCP-2930): the per-server intent to auto-approve new/changed tools past
 	// the trust baseline. Tri-state *bool — nil means "never set" (omitted from

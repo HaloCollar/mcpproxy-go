@@ -166,6 +166,25 @@
           <!-- Toggles Section -->
           <div class="divider mt-6">Options</div>
 
+          <!-- Scope tags (Option B): comma- or space-separated. An untagged
+               server is visible to every client session; a tagged server is
+               only visible to sessions requesting an intersecting scope. -->
+          <div class="form-control mb-3">
+            <label class="label">
+              <span class="label-text font-semibold">Scope Tags (Optional)</span>
+            </label>
+            <input
+              type="text"
+              v-model="formData.tagsText"
+              placeholder="halo, personal"
+              class="input input-bordered"
+              data-test="addserver-tags"
+            />
+            <span class="label-text-alt opacity-60 mt-1">
+              Comma- or space-separated. Empty = general (visible to all clients).
+            </span>
+          </div>
+
           <div class="space-y-3" data-test="addserver-options">
             <!-- Enabled -->
             <div class="form-control">
@@ -588,6 +607,7 @@ const formData = reactive({
   argsText: '',
   envText: '',
   workingDir: '',
+  tagsText: '',
   enabled: true,
   quarantined: true,
   isolated: false,
@@ -695,6 +715,16 @@ function parseArgs(): string[] {
   return formData.argsText.split('\n').map(line => line.trim()).filter(line => line)
 }
 
+// parseTags splits the comma/space/newline-separated tags input, trims, and
+// drops blanks. Returns an empty array when no tag is present.
+function parseTags(): string[] {
+  if (!formData.tagsText.trim()) return []
+  return formData.tagsText
+    .split(/[\s,]+/)
+    .map(t => t.trim())
+    .filter(t => t)
+}
+
 function parseEnv(): Record<string, string> {
   if (!formData.envText.trim()) return {}
   const env: Record<string, string> = {}
@@ -798,6 +828,7 @@ async function handleSubmit() {
     const command = formData.command === 'custom' ? formData.customCommand : formData.command
     const args = parseArgs()
     const env = parseEnv()
+    const tags = parseTags()
 
     const serverData: any = {
       operation: 'add',
@@ -805,6 +836,11 @@ async function handleSubmit() {
       protocol: formData.type,
       enabled: formData.enabled,
       quarantined: formData.quarantined
+    }
+
+    // Option B: scope tags (via the MCP upstream_servers add tags_json param).
+    if (tags.length > 0) {
+      serverData.tags_json = JSON.stringify(tags)
     }
 
     if (formData.type === 'http') {
@@ -1078,6 +1114,7 @@ function handleClose() {
   formData.argsText = ''
   formData.envText = ''
   formData.workingDir = ''
+  formData.tagsText = ''
   formData.enabled = true
   formData.quarantined = true
   formData.isolated = false

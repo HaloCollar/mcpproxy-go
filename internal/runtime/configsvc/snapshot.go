@@ -62,6 +62,11 @@ func (s *Snapshot) Clone() *config.Config {
 					clonedSrv.DisabledTools = make([]string, len(srv.DisabledTools))
 					copy(clonedSrv.DisabledTools, srv.DisabledTools)
 				}
+				// Option B: deep-copy the tag slice for the same immutability reason.
+				if srv.Tags != nil {
+					clonedSrv.Tags = make([]string, len(srv.Tags))
+					copy(clonedSrv.Tags, srv.Tags)
+				}
 
 				// Clone OAuth config if present
 				if srv.OAuth != nil {

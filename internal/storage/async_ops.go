@@ -189,6 +189,7 @@ func (am *AsyncManager) saveServerSync(serverConfig *config.ServerConfig) error 
 		OAuth:                  serverConfig.OAuth,
 		EnabledTools:           serverConfig.EnabledTools,
 		DisabledTools:          serverConfig.DisabledTools,
+		Tags:                   serverConfig.Tags,
 		AutoApproveToolChanges: serverConfig.AutoApproveToolChanges, // MCP-2940: persist so REST/UI toggle survives save/restart
 
 		SourceRegistryID:         serverConfig.SourceRegistryID,
