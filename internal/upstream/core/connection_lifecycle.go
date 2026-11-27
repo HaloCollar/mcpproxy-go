@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	uptransport "github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
 )
@@ -141,6 +142,23 @@ func isTransportClosedErr(err error) bool {
 		strings.Contains(lmsg, "broken pipe") ||
 		strings.Contains(lmsg, "file already closed") ||
 		strings.Contains(lmsg, "use of closed")
+}
+
+// IsTransportClosedError reports whether err is mcp-go's closed-transport
+// error: for a stdio server the child process exited (or closed its stdout)
+// and every later request fails with "transport closed". The managed client
+// uses it to treat a dead child as a lost connection, so the server leaves
+// Ready and is relaunched with backoff instead of staying Ready.
+//
+// It deliberately matches only that error (typed, or its text when a %v broke
+// the chain), not the wider EOF / closed-pipe shapes of isTransportClosedErr:
+// a stray EOF on an HTTP/SSE request must keep its existing handling.
+func IsTransportClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, uptransport.ErrTransportClosed) ||
+		strings.Contains(strings.ToLower(err.Error()), uptransport.ErrTransportClosed.Error())
 }
 
 // registerNotificationHandler registers a handler for MCP notifications.
