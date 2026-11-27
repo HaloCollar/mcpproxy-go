@@ -627,7 +627,7 @@ func (mc *Client) runListToolsAsLeader(listCtx context.Context, release func() b
 			mc.logger.Warn("Connection error detected during ListTools, updating server state",
 				zap.String("server", mc.GetConfig().Name),
 				zap.Error(err))
-			mc.StateManager.SetError(err)
+			mc.markConnectionLost(err)
 		}
 		return nil, fmt.Errorf("ListTools failed: %w", err)
 	}
@@ -660,7 +660,7 @@ func (mc *Client) CallTool(ctx context.Context, toolName string, args map[string
 					zap.String("tool", toolName),
 					zap.Error(err))
 			}
-			mc.StateManager.SetError(err)
+			mc.markConnectionLost(err)
 		} else {
 			// Log non-connection errors at error level
 			mc.logger.Error("Tool call failed",
@@ -981,7 +981,7 @@ func (mc *Client) performHealthCheck() {
 					zap.String("server", mc.GetConfig().Name),
 					zap.Int("consecutive_failures", mc.consecutiveHealthFailures),
 					zap.Error(err))
-				mc.StateManager.SetError(err)
+				mc.markConnectionLost(err)
 			} else {
 				mc.logger.Info("Health check failed transiently, tolerating below threshold",
 					zap.String("server", mc.GetConfig().Name),
@@ -1306,10 +1306,41 @@ func (mc *Client) waitForReconnectCompletion(ctx context.Context) error {
 	}
 }
 
+// markConnectionLost moves a Ready server to Error after a connection-class
+// failure, so the health loop and the manager's connect sweep relaunch it
+// through the StateManager backoff (ShouldRetry). Only a Ready server can lose
+// its connection: a late failure of an in-flight call after a deliberate
+// Disconnect, or while a reconnect is already Connecting, must not flip the
+// state (that would re-arm a stopped server or clobber the reconnect, and each
+// extra SetError would also lengthen the backoff).
+//
+// A closed stdio transport is reported as an exited server process, so the
+// server status says why it is not ready.
+func (mc *Client) markConnectionLost(err error) {
+	if !mc.StateManager.IsReady() {
+		mc.logger.Debug("Connection error on a server that is not Ready; state left unchanged",
+			zap.String("server", mc.GetConfig().Name),
+			zap.String("state", mc.StateManager.GetState().String()),
+			zap.Error(err))
+		return
+	}
+	if mc.GetConfig().Command != "" && core.IsTransportClosedError(err) {
+		err = fmt.Errorf("stdio server process exited or closed its pipes, relaunching with backoff: %w", err)
+	}
+	mc.StateManager.SetError(err)
+}
+
 // isConnectionError checks if an error indicates a connection problem
 func (mc *Client) isConnectionError(err error) bool {
 	if err == nil {
 		return false
+	}
+
+	// A dead stdio child surfaces as mcp-go's "transport closed" (or EOF /
+	// closed pipe), which none of the network strings below match. Without
+	// this the server stayed Ready with a dead transport (tools-zstgaq).
+	if core.IsTransportClosedError(err) {
+		return true
 	}
 
 	errStr := err.Error()
@@ -1535,7 +1566,7 @@ func (mc *Client) GetCachedToolCount(ctx context.Context) (int, error) {
 
 		// Check if it's a connection error and update state
 		if mc.isConnectionError(err) {
-			mc.StateManager.SetError(err)
+			mc.markConnectionLost(err)
 		}
 
 		// Return cached count if available, even if stale
